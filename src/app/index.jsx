@@ -250,8 +250,6 @@ export default function HomeScreen() {
           )}
 
           <ScrollView contentContainerStyle={styles.readerContent} accessibilityLabel="Recognized document text">
-            <ThemedText style={styles.readerText}>{recognizedText}</ThemedText>
-
             <ThemedView type="backgroundElement" style={styles.askSection}>
               <ThemedText style={styles.askSectionTitle}>Ask about this document</ThemedText>
 
@@ -296,6 +294,11 @@ export default function HomeScreen() {
                 </ThemedText>
               </Pressable>
             </ThemedView>
+
+            <ThemedText type="smallBold" themeColor="textSecondary" style={styles.rawTextLabel}>
+              FULL RECOGNIZED TEXT
+            </ThemedText>
+            <ThemedText style={styles.readerText}>{recognizedText}</ThemedText>
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -631,10 +634,14 @@ const styles = StyleSheet.create({
         fontWeight: '700',
     },
     askSection: {
-        marginTop: Spacing.five,
         borderRadius: 20,
         padding: Spacing.four,
         gap: Spacing.four,
+    },
+    rawTextLabel: {
+        marginTop: Spacing.five,
+        fontSize: 12,
+        letterSpacing: 1,
     },
     askSectionTitle: {
         fontSize: 19,
