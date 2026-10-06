@@ -1,13 +1,22 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { SymbolView } from 'expo-symbols';
 import { useRef, useState } from 'react';
-import { Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { AccessibilityInfo, Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { formatAnswer } from '@/services/answers';
+import { extractField } from '@/services/extractor';
 import { recognizeDocumentText } from '@/services/ocr';
+import { speak, stopSpeaking } from '@/services/speech';
+
+const FIELD_LABELS = {
+    amountDue: 'Amount due',
+    dueDate: 'Due date',
+};
+
 export default function HomeScreen() {
     const insets = useSafeAreaInsets();
     const theme = useTheme();
@@ -18,6 +27,9 @@ export default function HomeScreen() {
     const [recognizedText, setRecognizedText] = useState(null);
     const [isReading, setIsReading] = useState(false);
     const [ocrError, setOcrError] = useState(null);
+    const [answerMode, setAnswerMode] = useState('short');
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [fieldAnswer, setFieldAnswer] = useState(null);
     const openCamera = async () => {
         if (!permission?.granted) {
             const response = await requestPermission();
@@ -44,6 +56,7 @@ export default function HomeScreen() {
         setOcrError(null);
         try {
             const text = await recognizeDocumentText(capturedUri);
+            setFieldAnswer(null);
             setRecognizedText(text || 'No text was detected. Try taking another photo with better lighting.');
             closeCamera();
         }
@@ -53,6 +66,53 @@ export default function HomeScreen() {
         finally {
             setIsReading(false);
         }
+    };
+    const closeReader = () => {
+        stopSpeaking();
+        setIsSpeaking(false);
+        setFieldAnswer(null);
+        setRecognizedText(null);
+    };
+    const handleStopSpeaking = () => {
+        stopSpeaking();
+        setIsSpeaking(false);
+    };
+    const readWholePage = () => {
+        if (!recognizedText)
+            return;
+        setIsSpeaking(true);
+        speak(recognizedText, {
+            onDone: () => setIsSpeaking(false),
+            onStopped: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+        });
+    };
+    const handleField = (field) => {
+        if (!recognizedText)
+            return;
+        const result = extractField(recognizedText, field);
+        let spokenText;
+        let displayText;
+        if (result.value === null) {
+            spokenText = 'I could not find that clearly. Please scan again.';
+            displayText = spokenText;
+        }
+        else {
+            const phrased = formatAnswer(field, result.value, answerMode);
+            displayText = phrased;
+            spokenText =
+                result.confidence === 'low'
+                    ? `${phrased} I am not fully sure about this one, please check it.`
+                    : phrased;
+        }
+        setFieldAnswer({ field, text: displayText, confidence: result.confidence });
+        AccessibilityInfo.announceForAccessibility(spokenText);
+        setIsSpeaking(true);
+        speak(spokenText, {
+            onDone: () => setIsSpeaking(false),
+            onStopped: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+        });
     };
     return (<ThemedView style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
@@ -177,12 +237,65 @@ export default function HomeScreen() {
               </ThemedText>
               <ThemedText style={styles.readerTitle}>Your document</ThemedText>
             </View>
-            <Pressable accessibilityLabel="Close reading view" accessibilityRole="button" onPress={() => setRecognizedText(null)} style={({ pressed }) => [styles.readerCloseButton, pressed && styles.pressed]}>
+            <Pressable accessibilityLabel="Close reading view" accessibilityRole="button" onPress={closeReader} style={({ pressed }) => [styles.readerCloseButton, pressed && styles.pressed]}>
               <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor={theme.text} size={21}/>
             </Pressable>
           </View>
+
+          {isSpeaking && (
+            <Pressable accessibilityRole="button" accessibilityLabel="Stop speaking" accessibilityHint="Stops the voice reading immediately" onPress={handleStopSpeaking} style={({ pressed }) => [styles.stopBar, pressed && styles.pressed]}>
+              <SymbolView name={{ ios: 'stop.fill', android: 'stop', web: 'stop' }} tintColor="#FFFFFF" size={20}/>
+              <ThemedText style={styles.stopBarText}>Stop speaking</ThemedText>
+            </Pressable>
+          )}
+
           <ScrollView contentContainerStyle={styles.readerContent} accessibilityLabel="Recognized document text">
             <ThemedText style={styles.readerText}>{recognizedText}</ThemedText>
+
+            <ThemedView type="backgroundElement" style={styles.askSection}>
+              <ThemedText style={styles.askSectionTitle}>Ask about this document</ThemedText>
+
+              <View style={styles.toggleRow}>
+                <ThemedText type="small" themeColor="textSecondary">
+                  Answer length
+                </ThemedText>
+                <Pressable accessibilityRole="switch" accessibilityLabel="Answer length" accessibilityState={{ checked: answerMode === 'full' }} accessibilityValue={{ text: answerMode === 'short' ? 'Short answer' : 'Full answer' }} accessibilityHint="Double tap to switch between a short answer and a full sentence" onPress={() => setAnswerMode((mode) => (mode === 'short' ? 'full' : 'short'))} style={({ pressed }) => [styles.toggleTrack, pressed && styles.pressed]}>
+                  <View style={[styles.toggleOption, answerMode === 'short' && { backgroundColor: theme.backgroundSelected }]}>
+                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
+                      Short answer
+                    </ThemedText>
+                  </View>
+                  <View style={[styles.toggleOption, answerMode === 'full' && { backgroundColor: theme.backgroundSelected }]}>
+                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
+                      Full answer
+                    </ThemedText>
+                  </View>
+                </Pressable>
+              </View>
+
+              <View style={styles.fieldButtonRow}>
+                <Pressable accessibilityRole="button" accessibilityLabel="Amount due" accessibilityHint="Finds and speaks the amount you owe on this document" onPress={() => handleField('amountDue')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
+                  <SymbolView name={{ ios: 'dollarsign.circle.fill', android: 'attach_money', web: 'attach_money' }} tintColor="#FFFFFF" size={22}/>
+                  <ThemedText style={styles.fieldButtonText}>Amount due</ThemedText>
+                </Pressable>
+                <Pressable accessibilityRole="button" accessibilityLabel="Due date" accessibilityHint="Finds and speaks the date this bill is due" onPress={() => handleField('dueDate')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
+                  <SymbolView name={{ ios: 'calendar', android: 'event', web: 'event' }} tintColor="#FFFFFF" size={22}/>
+                  <ThemedText style={styles.fieldButtonText}>Due date</ThemedText>
+                </Pressable>
+              </View>
+
+              {fieldAnswer && (
+                <ThemedView style={[styles.answerCard, fieldAnswer.confidence === 'low' && styles.answerCardLow]} accessibilityLabel={`${FIELD_LABELS[fieldAnswer.field]}: ${fieldAnswer.text}`}>
+                  <ThemedText style={styles.answerText}>{fieldAnswer.text}</ThemedText>
+                </ThemedView>
+              )}
+
+              <Pressable accessibilityRole="button" accessibilityLabel="Read whole page" accessibilityHint="Speaks all of the text recognized on this document" onPress={readWholePage} style={({ pressed }) => [styles.readWholeButton, pressed && styles.pressed]}>
+                <ThemedText type="small" themeColor="textSecondary" style={styles.readWholeText}>
+                  Read whole page
+                </ThemedText>
+              </Pressable>
+            </ThemedView>
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -499,5 +612,109 @@ const styles = StyleSheet.create({
         fontSize: 24,
         lineHeight: 38,
         fontWeight: '500',
+    },
+    stopBar: {
+        minHeight: 56,
+        marginHorizontal: Spacing.four,
+        marginBottom: Spacing.three,
+        borderRadius: 16,
+        backgroundColor: '#B3261E',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.two,
+    },
+    stopBarText: {
+        color: '#FFFFFF',
+        fontSize: 17,
+        lineHeight: 23,
+        fontWeight: '700',
+    },
+    askSection: {
+        marginTop: Spacing.five,
+        borderRadius: 20,
+        padding: Spacing.four,
+        gap: Spacing.four,
+    },
+    askSectionTitle: {
+        fontSize: 19,
+        lineHeight: 26,
+        fontWeight: '700',
+    },
+    toggleRow: {
+        gap: Spacing.two,
+    },
+    toggleTrack: {
+        flexDirection: 'row',
+        minHeight: 48,
+        borderRadius: 14,
+        padding: Spacing.half,
+        backgroundColor: '#E5E7E6',
+        gap: Spacing.half,
+    },
+    toggleOption: {
+        flex: 1,
+        minHeight: 44,
+        borderRadius: 11,
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingHorizontal: Spacing.two,
+    },
+    toggleOptionText: {
+        fontSize: 14,
+        lineHeight: 20,
+    },
+    fieldButtonRow: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: Spacing.three,
+    },
+    fieldButton: {
+        flexGrow: 1,
+        flexBasis: 140,
+        minHeight: 56,
+        borderRadius: 16,
+        paddingHorizontal: Spacing.three,
+        paddingVertical: Spacing.two,
+        backgroundColor: '#173B3F',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.two,
+    },
+    fieldButtonText: {
+        color: '#FFFFFF',
+        fontSize: 16,
+        lineHeight: 22,
+        fontWeight: '700',
+        flexShrink: 1,
+    },
+    answerCard: {
+        borderRadius: 16,
+        borderWidth: 2,
+        borderColor: '#B9DDD1',
+        padding: Spacing.four,
+    },
+    answerCardLow: {
+        borderColor: '#9A6414',
+        backgroundColor: '#F9E7B7',
+    },
+    answerText: {
+        fontSize: 26,
+        lineHeight: 34,
+        fontWeight: '700',
+    },
+    readWholeButton: {
+        minHeight: 48,
+        borderRadius: 14,
+        borderWidth: 1,
+        borderColor: '#9AA6A5',
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingHorizontal: Spacing.three,
+        paddingVertical: Spacing.two,
+    },
+    readWholeText: {
+        fontWeight: '600',
     },
 });
