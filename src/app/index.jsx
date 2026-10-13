@@ -1,13 +1,23 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { SymbolView } from 'expo-symbols';
-import { useRef, useState } from 'react';
-import { Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useMemo, useRef, useState } from 'react';
+import { AccessibilityInfo, Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { BottomTabInset, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { formatAnswer } from '@/services/answers';
+import { documentToSpeech, structureDocument } from '@/services/document';
+import { extractField } from '@/services/extractor';
 import { recognizeDocumentText } from '@/services/ocr';
+import { speak, stopSpeaking } from '@/services/speech';
+
+const FIELD_LABELS = {
+    amountDue: 'Amount due',
+    dueDate: 'Due date',
+};
+
 export default function HomeScreen() {
     const insets = useSafeAreaInsets();
     const theme = useTheme();
@@ -18,6 +28,14 @@ export default function HomeScreen() {
     const [recognizedText, setRecognizedText] = useState(null);
     const [isReading, setIsReading] = useState(false);
     const [ocrError, setOcrError] = useState(null);
+    const [answerMode, setAnswerMode] = useState('short');
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [fieldAnswer, setFieldAnswer] = useState(null);
+    const documentBlocks = useMemo(() => structureDocument(recognizedText), [recognizedText]);
+    const startListening = () => {
+        // TODO: hook up speech recognition (e.g. expo-speech-recognition).
+        speak('Voice commands are not available yet. Use the take picture button below to scan a document.');
+    };
     const openCamera = async () => {
         if (!permission?.granted) {
             const response = await requestPermission();
@@ -44,8 +62,12 @@ export default function HomeScreen() {
         setOcrError(null);
         try {
             const text = await recognizeDocumentText(capturedUri);
+            setFieldAnswer(null);
             setRecognizedText(text || 'No text was detected. Try taking another photo with better lighting.');
             closeCamera();
+            AccessibilityInfo.announceForAccessibility(text
+                ? 'Document ready. The read aloud button is at the top of the screen.'
+                : 'No text was detected. Try taking another photo with better lighting.');
         }
         catch {
             setOcrError('We could not read this image. Try retaking the photo with the document in focus.');
@@ -54,83 +76,82 @@ export default function HomeScreen() {
             setIsReading(false);
         }
     };
+    const closeReader = () => {
+        stopSpeaking();
+        setIsSpeaking(false);
+        setFieldAnswer(null);
+        setRecognizedText(null);
+    };
+    const handleStopSpeaking = () => {
+        stopSpeaking();
+        setIsSpeaking(false);
+    };
+    const readWholePage = () => {
+        if (!recognizedText)
+            return;
+        setIsSpeaking(true);
+        speak(documentToSpeech(documentBlocks) || recognizedText, {
+            onDone: () => setIsSpeaking(false),
+            onStopped: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+        });
+    };
+    const handleField = (field) => {
+        if (!recognizedText)
+            return;
+        const result = extractField(recognizedText, field);
+        let spokenText;
+        let displayText;
+        if (result.value === null) {
+            spokenText = 'I could not find that clearly. Please scan again.';
+            displayText = spokenText;
+        }
+        else {
+            const phrased = formatAnswer(field, result.value, answerMode);
+            displayText = phrased;
+            spokenText =
+                result.confidence === 'low'
+                    ? `${phrased} I am not fully sure about this one, please check it.`
+                    : phrased;
+        }
+        setFieldAnswer({ field, text: displayText, confidence: result.confidence });
+        AccessibilityInfo.announceForAccessibility(spokenText);
+        setIsSpeaking(true);
+        speak(spokenText, {
+            onDone: () => setIsSpeaking(false),
+            onStopped: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+        });
+    };
     return (<ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[
-            styles.content,
+      <View style={[
+            styles.homeButtons,
             {
                 paddingTop: Math.max(insets.top, Spacing.three),
-                paddingBottom: insets.bottom + BottomTabInset + Spacing.five,
+                paddingBottom: insets.bottom + BottomTabInset + Spacing.three,
             },
         ]}>
-          <View style={styles.header}>
-            <View>
-              <ThemedText type="small" themeColor="textSecondary" style={styles.eyebrow}>
-                YOUR READING SPACE
-              </ThemedText>
-              <ThemedText style={styles.greeting}>Good morning</ThemedText>
-            </View>
-            <Pressable accessibilityLabel="Open accessibility settings" accessibilityRole="button" style={({ pressed }) => [styles.profileButton, pressed && styles.pressed]}>
-              <ThemedText style={styles.profileInitial}>A</ThemedText>
-            </Pressable>
-          </View>
-
-          <ThemedView style={styles.heroCard}>
-            <View style={styles.heroCopy}>
-              <View style={styles.heroIcon}>
-                <SymbolView name={{ ios: 'viewfinder', android: 'center_focus_strong', web: 'scan' }} tintColor="#173B3F" size={25}/>
-              </View>
-              <ThemedText style={styles.heroTitle}>Make any page easier to read.</ThemedText>
-              <ThemedText style={styles.heroBody}>
-                Scan a bill or document and Readify will bring the important details into focus.
-              </ThemedText>
-            </View>
-            <Pressable accessibilityLabel="Scan a document" accessibilityRole="button" onPress={openCamera} style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]}>
-              <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#FFFFFF" size={19}/>
-              <ThemedText style={styles.primaryButtonText}>Scan a document</ThemedText>
-              <SymbolView name={{ ios: 'arrow.right', android: 'arrow_forward', web: 'arrow_right' }} tintColor="#FFFFFF" size={17}/>
-            </Pressable>
-          </ThemedView>
-
-          <View style={styles.sectionHeader}>
-            <ThemedText style={styles.sectionTitle}>Pick up where you left off</ThemedText>
-            <Pressable accessibilityRole="button">
-              <ThemedText style={styles.seeAll}>See all</ThemedText>
-            </Pressable>
-          </View>
-
-          <Pressable accessibilityLabel="Open electricity bill" accessibilityRole="button" style={({ pressed }) => [styles.documentRow, pressed && styles.pressed]}>
-            <View style={styles.documentIcon}>
-              <SymbolView name={{ ios: 'doc.text.fill', android: 'description', web: 'description' }} tintColor="#F06A4F" size={23}/>
-            </View>
-            <View style={styles.documentCopy}>
-              <ThemedText style={styles.documentTitle}>Electricity bill</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">
-                Last opened yesterday
-              </ThemedText>
-            </View>
-            <SymbolView name={{ ios: 'chevron.right', android: 'chevron_right', web: 'chevron_right' }} tintColor={theme.textSecondary} size={18}/>
-          </Pressable>
-
-          <ThemedView type="backgroundElement" style={styles.tipCard}>
-            <View style={styles.tipIcon}>
-              <SymbolView name={{ ios: 'sun.max.fill', android: 'light_mode', web: 'light_mode' }} tintColor="#9A6414" size={19}/>
-            </View>
-            <View style={styles.tipCopy}>
-              <ThemedText style={styles.tipTitle}>A calmer way to read</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">
-                You can adjust text size, spacing, and contrast anytime.
-              </ThemedText>
-            </View>
-            <SymbolView name={{ ios: 'chevron.right', android: 'chevron_right', web: 'chevron_right' }} tintColor={theme.textSecondary} size={18}/>
-          </ThemedView>
-        </ScrollView>
-      </SafeAreaView>
+        <Pressable accessibilityRole="button" accessibilityLabel="Start speaking" accessibilityHint="Ask Readify a question with your voice" onPress={startListening} style={({ pressed }) => [styles.homeButton, styles.speakButton, pressed && styles.pressed]}>
+          <SymbolView name={{ ios: 'mic.fill', android: 'mic', web: 'mic' }} tintColor="#FFFFFF" size={96}/>
+          <ThemedText style={[styles.homeButtonText, { color: '#FFFFFF' }]}>Speak</ThemedText>
+        </Pressable>
+        <Pressable accessibilityRole="button" accessibilityLabel="Take a picture" accessibilityHint="Opens the camera to scan a document" onPress={openCamera} style={({ pressed }) => [styles.homeButton, styles.cameraButton, pressed && styles.pressed]}>
+          <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={96}/>
+          <ThemedText style={[styles.homeButtonText, { color: '#173B3F' }]}>Take picture</ThemedText>
+        </Pressable>
+      </View>
 
       <Modal animationType="slide" presentationStyle="fullScreen" visible={cameraOpen}>
         <ThemedView style={styles.cameraScreen}>
-          {capturedUri ? (<View style={styles.previewContainer}>
-              <Image source={{ uri: capturedUri }} style={styles.previewImage} resizeMode="contain"/>
+          {capturedUri ? (<View style={[
+                styles.previewContainer,
+                {
+                    paddingTop: insets.top + Spacing.two,
+                    paddingBottom: insets.bottom + Spacing.three,
+                    paddingLeft: insets.left + Spacing.four,
+                    paddingRight: insets.right + Spacing.four,
+                },
+            ]}>
               <View style={styles.previewHeader}>
                 <Pressable accessibilityLabel="Retake document photo" accessibilityRole="button" onPress={() => setCapturedUri(null)} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}>
                   <SymbolView name={{ ios: 'arrow.counterclockwise', android: 'refresh', web: 'refresh' }} tintColor="#FFFFFF" size={21}/>
@@ -140,6 +161,7 @@ export default function HomeScreen() {
                   <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor="#FFFFFF" size={21}/>
                 </Pressable>
               </View>
+              <Image source={{ uri: capturedUri }} style={styles.previewImage} resizeMode="contain"/>
               <View style={styles.previewActions}>
                 <ThemedText style={styles.previewHint}>Make sure all the text is in focus.</ThemedText>
                 <Pressable accessibilityLabel="Use this document" accessibilityRole="button" disabled={isReading} onPress={readDocument} style={({ pressed }) => [styles.usePhotoButton, pressed && styles.pressed]}>
@@ -151,7 +173,15 @@ export default function HomeScreen() {
               </View>
             </View>) : (<View style={styles.cameraContainer}>
               <CameraView ref={cameraRef} style={styles.camera} facing="back" mode="picture"/>
-              <View style={styles.cameraOverlay} pointerEvents="box-none">
+              <View style={[
+                styles.cameraOverlay,
+                {
+                    paddingTop: insets.top + Spacing.two,
+                    paddingBottom: insets.bottom + Spacing.four,
+                    paddingLeft: insets.left,
+                    paddingRight: insets.right,
+                },
+            ]} pointerEvents="box-none">
                 <View style={styles.cameraHeader}>
                   <ThemedText style={styles.cameraTitle}>Scan a document</ThemedText>
                   <Pressable accessibilityLabel="Close document scanner" accessibilityRole="button" onPress={closeCamera} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}>
@@ -169,7 +199,15 @@ export default function HomeScreen() {
       </Modal>
 
       <Modal animationType="slide" visible={recognizedText !== null}>
-        <SafeAreaView style={styles.readerScreen}>
+        <View style={[
+            styles.readerScreen,
+            {
+                backgroundColor: theme.background,
+                paddingTop: insets.top,
+                paddingLeft: insets.left + Spacing.four,
+                paddingRight: insets.right + Spacing.four,
+            },
+        ]}>
           <View style={styles.readerHeader}>
             <View>
               <ThemedText type="small" themeColor="textSecondary" style={styles.eyebrow}>
@@ -177,14 +215,85 @@ export default function HomeScreen() {
               </ThemedText>
               <ThemedText style={styles.readerTitle}>Your document</ThemedText>
             </View>
-            <Pressable accessibilityLabel="Close reading view" accessibilityRole="button" onPress={() => setRecognizedText(null)} style={({ pressed }) => [styles.readerCloseButton, pressed && styles.pressed]}>
+            <Pressable accessibilityLabel="Close reading view" accessibilityRole="button" onPress={closeReader} style={({ pressed }) => [styles.readerCloseButton, { backgroundColor: theme.backgroundSelected }, pressed && styles.pressed]}>
               <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor={theme.text} size={21}/>
             </Pressable>
           </View>
-          <ScrollView contentContainerStyle={styles.readerContent} accessibilityLabel="Recognized document text">
-            <ThemedText style={styles.readerText}>{recognizedText}</ThemedText>
+
+          <Pressable accessibilityRole="button" accessibilityLabel={isSpeaking ? 'Stop reading' : 'Read aloud'} accessibilityHint={isSpeaking ? 'Stops the voice reading immediately' : 'Reads the whole document out loud'} onPress={isSpeaking ? handleStopSpeaking : readWholePage} style={({ pressed }) => [styles.readAloudButton, isSpeaking && styles.readAloudButtonStop, pressed && styles.pressed]}>
+            <SymbolView name={isSpeaking
+            ? { ios: 'stop.fill', android: 'stop', web: 'stop' }
+            : { ios: 'speaker.wave.2.fill', android: 'volume_up', web: 'volume_up' }} tintColor="#FFFFFF" size={28}/>
+            <ThemedText style={styles.readAloudText}>{isSpeaking ? 'Stop reading' : 'Read aloud'}</ThemedText>
+          </Pressable>
+
+          <ScrollView contentContainerStyle={[styles.readerContent, { paddingBottom: insets.bottom + Spacing.six }]} accessibilityLabel="Recognized document text">
+            <ThemedView type="backgroundElement" style={styles.askSection}>
+              <ThemedText style={styles.askSectionTitle}>Ask about this document</ThemedText>
+
+              <View style={styles.toggleRow}>
+                <ThemedText type="small" themeColor="textSecondary">
+                  Answer length
+                </ThemedText>
+                <Pressable accessibilityRole="switch" accessibilityLabel="Answer length" accessibilityState={{ checked: answerMode === 'full' }} accessibilityValue={{ text: answerMode === 'short' ? 'Short answer' : 'Full answer' }} accessibilityHint="Double tap to switch between a short answer and a full sentence" onPress={() => setAnswerMode((mode) => (mode === 'short' ? 'full' : 'short'))} style={({ pressed }) => [styles.toggleTrack, { backgroundColor: theme.background }, pressed && styles.pressed]}>
+                  <View style={[styles.toggleOption, answerMode === 'short' && { backgroundColor: theme.backgroundSelected }]}>
+                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
+                      Short answer
+                    </ThemedText>
+                  </View>
+                  <View style={[styles.toggleOption, answerMode === 'full' && { backgroundColor: theme.backgroundSelected }]}>
+                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
+                      Full answer
+                    </ThemedText>
+                  </View>
+                </Pressable>
+              </View>
+
+              <View style={styles.fieldButtonRow}>
+                <Pressable accessibilityRole="button" accessibilityLabel="Amount due" accessibilityHint="Finds and speaks the amount you owe on this document" onPress={() => handleField('amountDue')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
+                  <SymbolView name={{ ios: 'dollarsign.circle.fill', android: 'attach_money', web: 'attach_money' }} tintColor="#FFFFFF" size={22}/>
+                  <ThemedText style={styles.fieldButtonText}>Amount due</ThemedText>
+                </Pressable>
+                <Pressable accessibilityRole="button" accessibilityLabel="Due date" accessibilityHint="Finds and speaks the date this bill is due" onPress={() => handleField('dueDate')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
+                  <SymbolView name={{ ios: 'calendar', android: 'event', web: 'event' }} tintColor="#FFFFFF" size={22}/>
+                  <ThemedText style={styles.fieldButtonText}>Due date</ThemedText>
+                </Pressable>
+              </View>
+
+              {fieldAnswer && (
+                <ThemedView style={[styles.answerCard, fieldAnswer.confidence === 'low' && styles.answerCardLow]} accessibilityLabel={`${FIELD_LABELS[fieldAnswer.field]}: ${fieldAnswer.text}`}>
+                  <ThemedText style={[styles.answerText, fieldAnswer.confidence === 'low' && styles.answerTextLow]}>{fieldAnswer.text}</ThemedText>
+                </ThemedView>
+              )}
+            </ThemedView>
+
+            <ThemedText type="smallBold" themeColor="textSecondary" style={styles.rawTextLabel}>
+              DOCUMENT
+            </ThemedText>
+            <ThemedView type="backgroundElement" style={styles.documentCard}>
+              {documentBlocks.map((block, index) => {
+                if (block.type === 'heading') {
+                    return (<ThemedText key={index} accessibilityRole="header" style={styles.docHeading}>
+                      {block.text}
+                    </ThemedText>);
+                }
+                if (block.type === 'fields') {
+                    return (<View key={index} style={styles.docFields}>
+                      {block.items.map((item, itemIndex) => (<View key={itemIndex} style={[styles.docField, itemIndex > 0 && { borderTopColor: theme.backgroundSelected, borderTopWidth: 1 }]}>
+                          <ThemedText type="small" themeColor="textSecondary" style={styles.docFieldLabel}>
+                            {item.label}
+                          </ThemedText>
+                          <ThemedText style={styles.docFieldValue}>{item.value}</ThemedText>
+                        </View>))}
+                    </View>);
+                }
+                return (<ThemedText key={index} style={styles.docParagraph}>
+                    {block.lines.join('\n')}
+                  </ThemedText>);
+            })}
+            </ThemedView>
           </ScrollView>
-        </SafeAreaView>
+        </View>
       </Modal>
     </ThemedView>);
 }
@@ -192,160 +301,10 @@ const styles = StyleSheet.create({
     container: {
         flex: 1,
     },
-    safeArea: {
-        flex: 1,
-        alignItems: 'center',
-    },
-    content: {
-        alignSelf: 'stretch',
-        flexGrow: 1,
-        maxWidth: MaxContentWidth,
-        paddingHorizontal: Spacing.four,
-        gap: Spacing.four,
-    },
-    header: {
-        flexDirection: 'row',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-    },
     eyebrow: {
         fontSize: 11,
         lineHeight: 16,
         letterSpacing: 1.2,
-        fontWeight: '700',
-    },
-    greeting: {
-        fontSize: 29,
-        lineHeight: 35,
-        fontWeight: '700',
-    },
-    profileButton: {
-        width: 46,
-        height: 46,
-        borderRadius: 23,
-        backgroundColor: '#F5C36A',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    profileInitial: {
-        color: '#173B3F',
-        fontSize: 18,
-        lineHeight: 22,
-        fontWeight: '700',
-    },
-    heroCard: {
-        backgroundColor: '#D9EEE7',
-        borderRadius: 24,
-        padding: Spacing.four,
-        gap: Spacing.four,
-    },
-    heroCopy: {
-        gap: Spacing.two,
-    },
-    heroIcon: {
-        width: 48,
-        height: 48,
-        borderRadius: 16,
-        backgroundColor: '#B9DDD1',
-        alignItems: 'center',
-        justifyContent: 'center',
-        marginBottom: Spacing.one,
-    },
-    heroTitle: {
-        color: '#173B3F',
-        fontSize: 30,
-        lineHeight: 35,
-        fontWeight: '700',
-        maxWidth: 340,
-    },
-    heroBody: {
-        color: '#426365',
-        fontSize: 16,
-        lineHeight: 24,
-        fontWeight: '500',
-        maxWidth: 390,
-    },
-    primaryButton: {
-        minHeight: 56,
-        borderRadius: 16,
-        paddingHorizontal: Spacing.three,
-        backgroundColor: '#173B3F',
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: Spacing.two,
-    },
-    primaryButtonText: {
-        color: '#FFFFFF',
-        fontSize: 16,
-        lineHeight: 22,
-        fontWeight: '700',
-        flex: 1,
-    },
-    sectionHeader: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        marginTop: Spacing.one,
-    },
-    sectionTitle: {
-        fontSize: 19,
-        lineHeight: 26,
-        fontWeight: '700',
-    },
-    seeAll: {
-        color: '#D45B43',
-        fontSize: 14,
-        lineHeight: 20,
-        fontWeight: '700',
-    },
-    documentRow: {
-        minHeight: 82,
-        borderRadius: 18,
-        padding: Spacing.three,
-        backgroundColor: '#FFF4EC',
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: Spacing.three,
-    },
-    documentIcon: {
-        width: 46,
-        height: 46,
-        borderRadius: 14,
-        backgroundColor: '#FFE0D2',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    documentCopy: {
-        flex: 1,
-        gap: Spacing.one,
-    },
-    documentTitle: {
-        fontSize: 16,
-        lineHeight: 21,
-        fontWeight: '700',
-    },
-    tipCard: {
-        borderRadius: 18,
-        padding: Spacing.three,
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: Spacing.three,
-    },
-    tipIcon: {
-        width: 42,
-        height: 42,
-        borderRadius: 13,
-        backgroundColor: '#F9E7B7',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    tipCopy: {
-        flex: 1,
-        gap: Spacing.one,
-    },
-    tipTitle: {
-        fontSize: 15,
-        lineHeight: 20,
         fontWeight: '700',
     },
     pressed: {
@@ -366,8 +325,6 @@ const styles = StyleSheet.create({
         ...StyleSheet.absoluteFill,
         alignItems: 'center',
         justifyContent: 'space-between',
-        paddingTop: 56,
-        paddingBottom: 40,
     },
     cameraHeader: {
         width: '100%',
@@ -425,7 +382,6 @@ const styles = StyleSheet.create({
         flex: 1,
         alignItems: 'center',
         justifyContent: 'center',
-        padding: Spacing.four,
         gap: Spacing.four,
     },
     previewImage: {
@@ -433,10 +389,7 @@ const styles = StyleSheet.create({
         flex: 1,
     },
     previewHeader: {
-        position: 'absolute',
-        top: 56,
-        left: Spacing.four,
-        right: Spacing.four,
+        width: '100%',
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'space-between',
@@ -470,7 +423,6 @@ const styles = StyleSheet.create({
     },
     readerScreen: {
         flex: 1,
-        paddingHorizontal: Spacing.four,
     },
     readerHeader: {
         flexDirection: 'row',
@@ -487,17 +439,163 @@ const styles = StyleSheet.create({
         width: 44,
         height: 44,
         borderRadius: 22,
-        backgroundColor: '#E5E7E6',
         alignItems: 'center',
         justifyContent: 'center',
     },
     readerContent: {
         paddingTop: Spacing.three,
-        paddingBottom: Spacing.six,
     },
-    readerText: {
-        fontSize: 24,
-        lineHeight: 38,
-        fontWeight: '500',
+    askSection: {
+        borderRadius: 20,
+        padding: Spacing.four,
+        gap: Spacing.four,
+    },
+    rawTextLabel: {
+        marginTop: Spacing.five,
+        fontSize: 12,
+        letterSpacing: 1,
+    },
+    askSectionTitle: {
+        fontSize: 19,
+        lineHeight: 26,
+        fontWeight: '700',
+    },
+    toggleRow: {
+        gap: Spacing.two,
+    },
+    toggleTrack: {
+        flexDirection: 'row',
+        minHeight: 48,
+        borderRadius: 14,
+        padding: Spacing.half,
+        gap: Spacing.half,
+    },
+    toggleOption: {
+        flex: 1,
+        minHeight: 44,
+        borderRadius: 11,
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingHorizontal: Spacing.two,
+    },
+    toggleOptionText: {
+        fontSize: 14,
+        lineHeight: 20,
+    },
+    fieldButtonRow: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: Spacing.three,
+    },
+    fieldButton: {
+        flexGrow: 1,
+        flexBasis: 140,
+        minHeight: 56,
+        borderRadius: 16,
+        paddingHorizontal: Spacing.three,
+        paddingVertical: Spacing.two,
+        backgroundColor: '#173B3F',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.two,
+    },
+    fieldButtonText: {
+        color: '#FFFFFF',
+        fontSize: 16,
+        lineHeight: 22,
+        fontWeight: '700',
+        flexShrink: 1,
+    },
+    answerCard: {
+        borderRadius: 16,
+        borderWidth: 2,
+        borderColor: '#B9DDD1',
+        padding: Spacing.four,
+    },
+    answerCardLow: {
+        borderColor: '#9A6414',
+        backgroundColor: '#F9E7B7',
+    },
+    answerText: {
+        fontSize: 26,
+        lineHeight: 34,
+        fontWeight: '700',
+    },
+    answerTextLow: {
+        color: '#3D2A06',
+    },
+    homeButtons: {
+        flex: 1,
+        paddingHorizontal: Spacing.three,
+        gap: Spacing.three,
+    },
+    homeButton: {
+        flex: 1,
+        borderRadius: 32,
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.three,
+    },
+    speakButton: {
+        backgroundColor: '#173B3F',
+    },
+    cameraButton: {
+        backgroundColor: '#F5C36A',
+    },
+    homeButtonText: {
+        fontSize: 40,
+        lineHeight: 48,
+        fontWeight: '800',
+    },
+    readAloudButton: {
+        minHeight: 72,
+        marginBottom: Spacing.three,
+        borderRadius: 20,
+        backgroundColor: '#173B3F',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.three,
+    },
+    readAloudButtonStop: {
+        backgroundColor: '#B3261E',
+    },
+    readAloudText: {
+        color: '#FFFFFF',
+        fontSize: 22,
+        lineHeight: 28,
+        fontWeight: '700',
+    },
+    documentCard: {
+        marginTop: Spacing.two,
+        borderRadius: 20,
+        padding: Spacing.four,
+        gap: Spacing.three,
+    },
+    docHeading: {
+        fontSize: 20,
+        lineHeight: 26,
+        fontWeight: '700',
+        marginTop: Spacing.one,
+    },
+    docFields: {
+        gap: 0,
+    },
+    docField: {
+        paddingVertical: Spacing.two,
+        gap: Spacing.half,
+    },
+    docFieldLabel: {
+        fontWeight: '600',
+    },
+    docFieldValue: {
+        fontSize: 18,
+        lineHeight: 24,
+        fontWeight: '700',
+    },
+    docParagraph: {
+        fontSize: 17,
+        lineHeight: 26,
     },
 });
