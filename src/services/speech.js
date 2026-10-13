@@ -11,12 +11,42 @@ import * as Speech from 'expo-speech';
  */
 export function speak(text, callbacks = {}) {
     Speech.stop();
-    Speech.speak(text, {
-        onStart: callbacks.onStart,
-        onDone: callbacks.onDone,
-        onStopped: callbacks.onStopped,
-        onError: callbacks.onError,
+    // Android rejects utterances over Speech.maxSpeechInputLength (~4000
+    // chars), so long documents are queued as several smaller chunks.
+    const chunks = splitIntoChunks(text, MAX_CHUNK_LENGTH);
+    if (chunks.length === 0) {
+        callbacks.onDone?.();
+        return;
+    }
+    chunks.forEach((chunk, index) => {
+        const isFirst = index === 0;
+        const isLast = index === chunks.length - 1;
+        Speech.speak(chunk, {
+            onStart: isFirst ? callbacks.onStart : undefined,
+            onDone: isLast ? callbacks.onDone : undefined,
+            onStopped: callbacks.onStopped,
+            onError: callbacks.onError,
+        });
     });
+}
+
+const MAX_CHUNK_LENGTH = 3000;
+
+function splitIntoChunks(text, maxLength) {
+    const chunks = [];
+    let remaining = text;
+    while (remaining.length > maxLength) {
+        const slice = remaining.slice(0, maxLength);
+        // Prefer breaking after a sentence, then at a space.
+        const breakAt = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('\n'));
+        const cut = breakAt > 0 ? breakAt + 1 : slice.lastIndexOf(' ') > 0 ? slice.lastIndexOf(' ') : maxLength;
+        chunks.push(remaining.slice(0, cut).trim());
+        remaining = remaining.slice(cut);
+    }
+    if (remaining.trim()) {
+        chunks.push(remaining.trim());
+    }
+    return chunks;
 }
 
 export function stopSpeaking() {
