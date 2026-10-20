@@ -25,19 +25,62 @@ export function extractField(ocrText, field) {
 // Amount due
 // ---------------------------------------------------------------------------
 
-// Priority order: the first label that is found (with a nearby value) wins.
+// Priority order: the first label that is found (with a nearby value) wins,
+// so the most specific wordings come first and a bare "total" comes last.
 const AMOUNT_LABELS = [
     'total amount due',
     'amount due',
     'total due',
     'balance due',
-    'pay this amount',
     'amount payable',
+    'total payable',
+    'net payable',
+    'pay this amount',
+    'amount to pay',
+    'total to pay',
+    'total amount',
+    'final amount',
+    'grand total',
+    'amount owing',
+    'amount owed',
+    'balance owing',
+    'total owing',
+    'total owed',
+    'new balance',
+    'current balance',
+    'total balance',
+    'total charges',
+    'net amount',
+    'total',
 ];
 
 // Lines containing any of these words are skipped, even if they also contain
 // a label above, so a "Minimum payment" line never gets returned by mistake.
-const AMOUNT_EXCLUDE_KEYWORDS = ['minimum', 'previous balance', 'last payment', 'credit'];
+const AMOUNT_EXCLUDE_KEYWORDS = [
+    'minimum',
+    'previous balance',
+    'last payment',
+    'credit',
+    'sub total',
+    'sub-total',
+];
+
+// A bare "Total" is only trusted when the line isn't the total of something
+// else, like "Total tax" or "Total paid".
+const BARE_TOTAL_EXCLUDE_KEYWORDS = [
+    'tax',
+    'gst',
+    'hst',
+    'pst',
+    'vat',
+    'discount',
+    'saving',
+    'paid',
+    'items',
+    'qty',
+    'quantity',
+    'tip',
+];
 
 // Requires either a currency symbol (or the OCR slip "S" for "$") or a
 // two-digit decimal part, so we don't pick up unrelated plain integers
@@ -51,8 +94,12 @@ function extractAmountDue(ocrText) {
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             const lower = line.toLowerCase();
-            const labelIndex = lower.indexOf(label);
-            if (labelIndex === -1 || containsExcluded(lower, AMOUNT_EXCLUDE_KEYWORDS)) {
+            const labelIndex = findLabel(lower, label);
+            if (
+                labelIndex === -1 ||
+                containsExcluded(lower, AMOUNT_EXCLUDE_KEYWORDS) ||
+                (label === 'total' && containsExcluded(lower, BARE_TOTAL_EXCLUDE_KEYWORDS))
+            ) {
                 continue;
             }
 
@@ -89,11 +136,46 @@ function containsExcluded(lowerLine, keywords) {
     return keywords.some((keyword) => lowerLine.includes(keyword));
 }
 
+/**
+ * Finds `label` as whole words, so "total" doesn't match "subtotal".
+ * @param {string} lowerLine
+ * @param {string} label
+ * @returns {number} index of the label, or -1
+ */
+function findLabel(lowerLine, label) {
+    const match = new RegExp(`(^|[^a-z])${label}(?![a-z])`).exec(lowerLine);
+    return match ? match.index + match[1].length : -1;
+}
+
 // ---------------------------------------------------------------------------
 // Due date
 // ---------------------------------------------------------------------------
 
-const DATE_LABELS = ['due date', 'payment due', 'pay by', 'due on', 'due by'];
+// Priority order, most specific first.
+const DATE_LABELS = [
+    'due date',
+    'date due',
+    'payment due',
+    'payment deadline',
+    'pay by',
+    'pay before',
+    'pay on or before',
+    'payable by',
+    'payable before',
+    'payable on or before',
+    'due on',
+    'due by',
+    'due before',
+    'must be paid by',
+    'to be paid by',
+    'last day to pay',
+    'deadline',
+    'due',
+];
+
+// Labels too vague to trust a date on the following lines, e.g. "Amount due"
+// followed by an unrelated statement date. Only a date on the same line counts.
+const SAME_LINE_ONLY_DATE_LABELS = ['due'];
 
 const MONTH_NAMES = [
     'january',
@@ -134,13 +216,16 @@ function extractDueDate(ocrText) {
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             const lower = line.toLowerCase();
-            if (lower.indexOf(label) === -1) {
+            if (findLabel(lower, label) === -1) {
                 continue;
             }
 
             const sameLineResult = parseDateCandidate(line);
             if (sameLineResult) {
                 return { ...sameLineResult, evidence: line.trim() };
+            }
+            if (SAME_LINE_ONLY_DATE_LABELS.includes(label)) {
+                continue;
             }
 
             for (let j = i + 1; j <= i + 2 && j < lines.length; j++) {

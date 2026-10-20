@@ -17,6 +17,7 @@ export async function recognizeDocumentText(uri) {
                 x: line.frame.left,
                 y: line.frame.top,
                 height: line.frame.height,
+                corners: line.cornerPoints,
             });
         }
     }

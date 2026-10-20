@@ -43,6 +43,55 @@ describe('reconstructText', () => {
     });
 });
 
+// Simulates the same invoice photographed at an angle: each line is rotated
+// about the origin, and x/y/height become the axis-aligned box ML Kit
+// reports for the rotated line, with the true corners alongside.
+function tilt(lines, degrees, width = 120) {
+    const angle = (degrees * Math.PI) / 180;
+    const rotate = ({ x, y }) => ({
+        x: x * Math.cos(angle) - y * Math.sin(angle),
+        y: x * Math.sin(angle) + y * Math.cos(angle),
+    });
+    return lines.map(({ text, x, y, height }) => {
+        const corners = [
+            { x, y },
+            { x: x + width, y },
+            { x: x + width, y: y + height },
+            { x, y: y + height },
+        ].map(rotate);
+        const xs = corners.map((point) => point.x);
+        const ys = corners.map((point) => point.y);
+        return {
+            text,
+            x: Math.min(...xs),
+            y: Math.min(...ys),
+            height: Math.max(...ys) - Math.min(...ys),
+            corners,
+        };
+    });
+}
+
+describe('reconstructText on a tilted page', () => {
+    test.each([5, -5, 8])('rebuilds rows when the page is rotated %i degrees', (degrees) => {
+        const text = reconstructText(tilt(TWO_COLUMN_INVOICE_LINES, degrees));
+
+        expect(text).toBe('Invoice No.: 042045\nIssue date: 06/09/2023\nDue date: 20/09/2023');
+    });
+
+    test('a nearly straight page is left as-is', () => {
+        const text = reconstructText(tilt(TWO_COLUMN_INVOICE_LINES, 0.2));
+
+        expect(text).toBe('Invoice No.: 042045\nIssue date: 06/09/2023\nDue date: 20/09/2023');
+    });
+
+    test('ignores corners unless every segment has them', () => {
+        const segments = tilt(TWO_COLUMN_INVOICE_LINES, 0);
+        delete segments[0].corners;
+
+        expect(reconstructText(segments)).toBe('Invoice No.: 042045\nIssue date: 06/09/2023\nDue date: 20/09/2023');
+    });
+});
+
 describe('reconstructText + extractField (two-column invoice regression)', () => {
     test('finds the due date even though the label and value are far apart in raw block order', () => {
         const text = reconstructText(TWO_COLUMN_INVOICE_LINES);

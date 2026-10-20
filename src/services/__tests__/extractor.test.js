@@ -104,3 +104,70 @@ describe('extractField - dueDate', () => {
         expect(result).toEqual({ value: null, confidence: 'none', evidence: '' });
     });
 });
+
+describe('extractField - amountDue, other wordings', () => {
+    test.each([
+        'Total Amount: $84.20',
+        'Total Amount\n$84.20',
+        'Final Amount: $84.20',
+        'Grand Total $84.20',
+        'Amount Payable: $84.20',
+        'Total Payable $84.20',
+        'Amount to Pay: $84.20',
+        'Balance Owing: $84.20',
+        'Amount Owed $84.20',
+        'New Balance: $84.20',
+        'Current Balance $84.20',
+        'Total Charges: $84.20',
+        'Total: $84.20',
+    ])('finds the amount in "%s"', (text) => {
+        expect(extractField(text, 'amountDue').value).toBe('$84.20');
+    });
+
+    test('prefers "Amount due" over a bare "Total" elsewhere on the page', () => {
+        const text = 'Total: $120.00\nAmount Due: $84.20';
+        expect(extractField(text, 'amountDue').value).toBe('$84.20');
+    });
+
+    test('a bare "Total" ignores subtotal, tax and paid lines', () => {
+        const text = 'Subtotal: $70.00\nTotal Tax: $14.20\nTotal: $84.20\nTotal Paid: $0.00';
+        expect(extractField(text, 'amountDue').value).toBe('$84.20');
+    });
+
+    test('"Sub total" is not taken as the total', () => {
+        const text = 'Sub Total: $70.00\nTotal Amount $84.20';
+        expect(extractField(text, 'amountDue').value).toBe('$84.20');
+    });
+
+    test('"Total" does not match inside other words', () => {
+        expect(extractField('Totally free: $5.00', 'amountDue').value).toBeNull();
+    });
+});
+
+describe('extractField - dueDate, other wordings', () => {
+    test.each([
+        'Date Due: October 25, 2026',
+        'Payment Deadline: October 25, 2026',
+        'Please pay before October 25, 2026',
+        'Pay on or before October 25, 2026',
+        'Payable by October 25, 2026',
+        'Due before October 25, 2026',
+        'Must be paid by October 25, 2026',
+        'To be paid by 25 October 2026',
+        'Last day to pay: October 25, 2026',
+        'Deadline\nOctober 25, 2026',
+        'Due: October 25, 2026',
+    ])('finds the date in "%s"', (text) => {
+        expect(extractField(text, 'dueDate').value).toBe('2026-10-25');
+    });
+
+    test('a bare "due" only trusts a date on the same line', () => {
+        const text = 'Amount due $84.20\nStatement date: September 15, 2026';
+        expect(extractField(text, 'dueDate').value).toBeNull();
+    });
+
+    test('a specific label wins over a bare "due"', () => {
+        const text = 'Due: September 15, 2026\nDue Date: October 25, 2026';
+        expect(extractField(text, 'dueDate').value).toBe('2026-10-25');
+    });
+});

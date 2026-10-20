@@ -1,529 +1,503 @@
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as Haptics from 'expo-haptics';
 import { SymbolView } from 'expo-symbols';
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AccessibilityInfo, Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { formatAnswer } from '@/services/answers';
+import { useVoiceQuestion } from '@/hooks/use-voice-question';
+import { interpret, introSpeech, respond } from '@/services/assistant';
+import { parseConfirmation } from '@/services/commands';
 import { documentToSpeech, structureDocument } from '@/services/document';
-import { extractField } from '@/services/extractor';
 import { recognizeDocumentText } from '@/services/ocr';
+import { scanDocumentImage } from '@/services/scanner';
 import { speak, stopSpeaking } from '@/services/speech';
 
-const FIELD_LABELS = {
-    amountDue: 'Amount due',
-    dueDate: 'Due date',
-};
+const HOME_HELP = 'To read a document, say: scan a document. Or tap the Take picture button at the bottom of the screen.';
+const VOICE_UNAVAILABLE =
+    'Voice questions are turned off, because Readify cannot use the microphone or speech recognition. ' +
+    'You can turn them on in Settings. For now, use the buttons on the screen.';
+
+const CONFIRM_QUESTION = 'Do you want me to read this document? Say yes or no.';
+// How many times to ask again when the yes/no answer isn't heard, before
+// leaving it to the buttons.
+const MAX_CONFIRM_RETRIES = 2;
+
+// Gives the reader screen time to finish closing before the scanner opens
+// on top of it; iOS won't present the scanner over a closing screen.
+const REOPEN_SCANNER_DELAY_MS = 600;
 
 export default function HomeScreen() {
     const insets = useSafeAreaInsets();
     const theme = useTheme();
-    const cameraRef = useRef(null);
-    const [permission, requestPermission] = useCameraPermissions();
-    const [cameraOpen, setCameraOpen] = useState(false);
-    const [capturedUri, setCapturedUri] = useState(null);
     const [recognizedText, setRecognizedText] = useState(null);
     const [isReading, setIsReading] = useState(false);
     const [ocrError, setOcrError] = useState(null);
-    const [answerMode, setAnswerMode] = useState('short');
     const [isSpeaking, setIsSpeaking] = useState(false);
-    const [fieldAnswer, setFieldAnswer] = useState(null);
-    const documentBlocks = useMemo(() => structureDocument(recognizedText), [recognizedText]);
-    const startListening = () => {
-        // TODO: hook up speech recognition (e.g. expo-speech-recognition).
-        speak('Voice commands are not available yet. Use the take picture button below to scan a document.');
-    };
-    const openCamera = async () => {
-        if (!permission?.granted) {
-            const response = await requestPermission();
-            if (!response.granted) {
-                return;
-            }
+    const [answer, setAnswer] = useState(null);
+    const [lastSpeech, setLastSpeech] = useState(null);
+    const [voiceUnavailable, setVoiceUnavailable] = useState(false);
+    const [screenReaderOn, setScreenReaderOn] = useState(false);
+    // A scanned page waiting for the user to confirm they want it read.
+    const [pendingUri, setPendingUri] = useState(null);
+    // Text recognition for the pending page, started as soon as it's taken
+    // so it's ready by the time the user answers.
+    const pendingTextRef = useRef(null);
+    const confirmRetriesRef = useRef(0);
+    const documentSpeech = useMemo(() => documentToSpeech(structureDocument(recognizedText)), [recognizedText]);
+    const readerOpen = recognizedText !== null;
+
+    useEffect(() => {
+        AccessibilityInfo.isScreenReaderEnabled().then(setScreenReaderOn);
+        const subscription = AccessibilityInfo.addEventListener('screenReaderChanged', setScreenReaderOn);
+        return () => subscription.remove();
+    }, []);
+
+    /**
+     * Speaks `text`. If `display` is given it also becomes the answer shown
+     * on screen, and is what "repeat" says again. `onFinished` runs only if
+     * the speech plays to the end without being stopped.
+     */
+    const say = (text, display, onFinished) => {
+        if (display !== undefined) {
+            setAnswer(display);
+            setLastSpeech(text);
         }
-        setCameraOpen(true);
-    };
-    const captureDocument = async () => {
-        const picture = await cameraRef.current?.takePictureAsync({ quality: 0.9 });
-        if (picture?.uri) {
-            setCapturedUri(picture.uri);
-        }
-    };
-    const closeCamera = () => {
-        setCameraOpen(false);
-        setCapturedUri(null);
-    };
-    const readDocument = async () => {
-        if (!capturedUri)
-            return;
-        setIsReading(true);
-        setOcrError(null);
-        try {
-            const text = await recognizeDocumentText(capturedUri);
-            setFieldAnswer(null);
-            setRecognizedText(text || 'No text was detected. Try taking another photo with better lighting.');
-            closeCamera();
-            AccessibilityInfo.announceForAccessibility(text
-                ? 'Document ready. The read aloud button is at the top of the screen.'
-                : 'No text was detected. Try taking another photo with better lighting.');
-        }
-        catch {
-            setOcrError('We could not read this image. Try retaking the photo with the document in focus.');
-        }
-        finally {
-            setIsReading(false);
-        }
-    };
-    const closeReader = () => {
-        stopSpeaking();
-        setIsSpeaking(false);
-        setFieldAnswer(null);
-        setRecognizedText(null);
+        setIsSpeaking(true);
+        speak(text, {
+            onDone: () => {
+                setIsSpeaking(false);
+                onFinished?.();
+            },
+            onStopped: () => setIsSpeaking(false),
+            onError: () => setIsSpeaking(false),
+        });
     };
     const handleStopSpeaking = () => {
         stopSpeaking();
         setIsSpeaking(false);
     };
-    const readWholePage = () => {
-        if (!recognizedText)
+
+    const scanDocument = async () => {
+        if (isReading)
             return;
-        setIsSpeaking(true);
-        speak(documentToSpeech(documentBlocks) || recognizedText, {
-            onDone: () => setIsSpeaking(false),
-            onStopped: () => setIsSpeaking(false),
-            onError: () => setIsSpeaking(false),
-        });
+        voice.cancel();
+        handleStopSpeaking();
+        setOcrError(null);
+        setPendingUri(null);
+        pendingTextRef.current = null;
+        let uri;
+        try {
+            uri = await scanDocumentImage();
+        }
+        catch {
+            reportScanError('The scanner could not start. Please try again.');
+            return;
+        }
+        if (!uri) {
+            say('Scanning cancelled.');
+            return;
+        }
+        pendingTextRef.current = recognizeDocumentText(uri).then((text) => ({ text, failed: false }), () => ({ text: '', failed: true }));
+        confirmRetriesRef.current = 0;
+        setPendingUri(uri);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        askToReadPending(`Picture taken. ${CONFIRM_QUESTION}`);
     };
-    const handleField = (field) => {
-        if (!recognizedText)
+    // Asks the yes/no question, then listens for the answer once it's been said.
+    const askToReadPending = (question) => {
+        say(question, undefined, () => voice.listen());
+    };
+    const askToReadPendingAgain = (reason) => {
+        confirmRetriesRef.current += 1;
+        if (confirmRetriesRef.current > MAX_CONFIRM_RETRIES) {
+            say(`${reason} You can use the buttons on the screen instead. Read this document is at the top.`);
             return;
-        const result = extractField(recognizedText, field);
-        let spokenText;
-        let displayText;
-        if (result.value === null) {
-            spokenText = 'I could not find that clearly. Please scan again.';
-            displayText = spokenText;
+        }
+        askToReadPending(`${reason} ${CONFIRM_QUESTION}`);
+    };
+    const readPendingDocument = async () => {
+        const pending = pendingTextRef.current;
+        if (!pending)
+            return;
+        pendingTextRef.current = null;
+        voice.cancel();
+        handleStopSpeaking();
+        setPendingUri(null);
+        setIsReading(true);
+        say('Reading your document.');
+        const { text, failed } = await pending;
+        setIsReading(false);
+        if (failed) {
+            reportScanError('We could not read this document. Please try scanning it again.');
+            return;
+        }
+        if (!text) {
+            reportScanError('No text was found. Try scanning again with more light.');
+            return;
+        }
+        setAnswer(null);
+        setLastSpeech(null);
+        setRecognizedText(text);
+        say(introSpeech(screenReaderOn));
+    };
+    const cancelPendingDocument = () => {
+        pendingTextRef.current = null;
+        voice.cancel();
+        setPendingUri(null);
+        say('Okay. The picture was not read.');
+    };
+    const handleConfirmation = (transcripts) => {
+        const confirmation = transcripts.map(parseConfirmation).find(Boolean);
+        if (confirmation === 'yes') {
+            readPendingDocument();
+        }
+        else if (confirmation === 'no') {
+            scanDocument();
+        }
+        else if (confirmation === 'cancel') {
+            cancelPendingDocument();
         }
         else {
-            const phrased = formatAnswer(field, result.value, answerMode);
-            displayText = phrased;
-            spokenText =
-                result.confidence === 'low'
-                    ? `${phrased} I am not fully sure about this one, please check it.`
-                    : phrased;
+            askToReadPendingAgain('Sorry, I did not catch that.');
         }
-        setFieldAnswer({ field, text: displayText, confidence: result.confidence });
-        AccessibilityInfo.announceForAccessibility(spokenText);
-        setIsSpeaking(true);
-        speak(spokenText, {
-            onDone: () => setIsSpeaking(false),
-            onStopped: () => setIsSpeaking(false),
-            onError: () => setIsSpeaking(false),
-        });
     };
+    const reportScanError = (message) => {
+        setOcrError(message);
+        say(message);
+    };
+
+    const closeReader = () => {
+        voice.cancel();
+        handleStopSpeaking();
+        setAnswer(null);
+        setLastSpeech(null);
+        setRecognizedText(null);
+    };
+
+    const runCommand = (command) => {
+        if (!readerOpen) {
+            if (command.type === 'scan') {
+                scanDocument();
+            }
+            else if (command.type === 'stop') {
+                handleStopSpeaking();
+            }
+            else {
+                say(HOME_HELP);
+            }
+            return;
+        }
+        const reply = respond(command, { documentText: recognizedText, documentSpeech, lastSpeech, screenReaderOn });
+        switch (reply.type) {
+            case 'say':
+                say(reply.speech, reply.display);
+                break;
+            case 'stop':
+                handleStopSpeaking();
+                break;
+            case 'close':
+                closeReader();
+                break;
+            case 'scan':
+                closeReader();
+                setTimeout(scanDocument, REOPEN_SCANNER_DELAY_MS);
+                break;
+        }
+    };
+
+    const voice = useVoiceQuestion({
+        onResult: (transcripts) => {
+            Haptics.selectionAsync();
+            if (pendingUri) {
+                handleConfirmation(transcripts);
+                return;
+            }
+            runCommand(interpret(transcripts).command);
+        },
+        onError: (reason) => {
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+            const voiceOff = ['not-allowed', 'service-not-allowed', 'unavailable', 'language-not-supported'].includes(reason);
+            if (pendingUri && !voiceOff) {
+                askToReadPendingAgain(reason === 'no-speech' || reason === 'speech-timeout'
+                    ? 'I did not hear an answer.'
+                    : 'Sorry, something went wrong while listening.');
+            }
+            else if (voiceOff) {
+                setVoiceUnavailable(true);
+                say(VOICE_UNAVAILABLE);
+            }
+            else if (reason === 'no-speech' || reason === 'speech-timeout') {
+                say('I did not hear a question.');
+            }
+            else {
+                say('Sorry, something went wrong while listening. Please try again.');
+            }
+        },
+    });
+
+    // The one main action: stop anything being said and listen for a question.
+    // Tapping again while listening finishes the question early.
+    const toggleAsk = () => {
+        if (voice.isListening) {
+            voice.stop();
+            return;
+        }
+        handleStopSpeaking();
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        voice.listen();
+    };
+
+    const askTitle = voice.isListening ? 'Listening…' : isSpeaking ? 'Tap to stop' : 'Tap to ask';
+    const askSubtitle = voice.isListening
+        ? voice.transcript ? `“${voice.transcript}”` : 'Say what you want to know'
+        : isSpeaking ? 'Then ask another question' : 'Like “due date” or “amount due”';
+    const askLabel = voice.isListening ? 'Listening' : isSpeaking ? 'Stop and ask a question' : 'Ask a question';
+    const askHint = voice.isListening
+        ? 'Say your question. Double tap to finish early.'
+        : 'Then say what you want to know, like due date, amount due, or read everything.';
+
+    const homePadding = {
+        paddingTop: Math.max(insets.top, Spacing.three),
+        paddingBottom: insets.bottom + BottomTabInset + Spacing.three,
+    };
+
     return (<ThemedView style={styles.container}>
-      <View style={[
-            styles.homeButtons,
-            {
-                paddingTop: Math.max(insets.top, Spacing.three),
-                paddingBottom: insets.bottom + BottomTabInset + Spacing.three,
-            },
-        ]}>
-        <Pressable accessibilityRole="button" accessibilityLabel="Start speaking" accessibilityHint="Ask Readify a question with your voice" onPress={startListening} style={({ pressed }) => [styles.homeButton, styles.speakButton, pressed && styles.pressed]}>
+      {pendingUri ? (<View style={[styles.confirmView, homePadding]}>
+          <View accessible accessibilityRole="header" accessibilityLabel={`Picture taken. ${voice.isListening ? 'Listening. Say yes or no.' : 'Read this document?'}`}>
+            <ThemedText style={styles.confirmTitle}>Picture taken</ThemedText>
+            <ThemedText themeColor="textSecondary" style={styles.confirmSubtitle}>
+              {voice.isListening ? 'Listening… say yes or no' : 'Read this document?'}
+            </ThemedText>
+          </View>
+          <Image source={{ uri: pendingUri }} style={styles.confirmImage} resizeMode="contain"/>
+          <Pressable accessibilityRole="button" accessibilityLabel="Yes, read this document" onPress={readPendingDocument} style={({ pressed }) => [styles.confirmButton, styles.speakButton, pressed && styles.pressed]}>
+            <SymbolView name={{ ios: 'checkmark.circle.fill', android: 'check_circle', web: 'check_circle' }} tintColor="#FFFFFF" size={44}/>
+            <ThemedText style={[styles.confirmButtonText, { color: '#FFFFFF' }]}>Yes, read it</ThemedText>
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="No, take another picture" onPress={scanDocument} style={({ pressed }) => [styles.confirmButton, styles.cameraButton, pressed && styles.pressed]}>
+            <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={44}/>
+            <ThemedText style={[styles.confirmButtonText, { color: '#173B3F' }]}>No, take another</ThemedText>
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Cancel" accessibilityHint="Goes back without reading the picture" onPress={cancelPendingDocument} style={({ pressed }) => [styles.cancelButton, { backgroundColor: theme.backgroundElement }, pressed && styles.pressed]}>
+            <ThemedText style={styles.cancelButtonText}>Cancel</ThemedText>
+          </Pressable>
+        </View>) : (<View style={[styles.homeButtons, homePadding]}>
+        <Pressable accessibilityRole="button" accessibilityLabel={voice.isListening && !readerOpen ? 'Listening' : 'Speak'} accessibilityHint="Then say: scan a document" onPress={toggleAsk} style={({ pressed }) => [styles.homeButton, styles.speakButton, pressed && styles.pressed]}>
           <SymbolView name={{ ios: 'mic.fill', android: 'mic', web: 'mic' }} tintColor="#FFFFFF" size={96}/>
-          <ThemedText style={[styles.homeButtonText, { color: '#FFFFFF' }]}>Speak</ThemedText>
+          <ThemedText style={[styles.homeButtonText, { color: '#FFFFFF' }]}>
+            {voice.isListening && !readerOpen ? 'Listening…' : 'Speak'}
+          </ThemedText>
         </Pressable>
-        <Pressable accessibilityRole="button" accessibilityLabel="Take a picture" accessibilityHint="Opens the camera to scan a document" onPress={openCamera} style={({ pressed }) => [styles.homeButton, styles.cameraButton, pressed && styles.pressed]}>
+        <Pressable accessibilityRole="button" accessibilityLabel={isReading ? 'Reading document' : 'Take a picture'} accessibilityHint="Opens the document scanner" accessibilityState={{ busy: isReading, disabled: isReading }} disabled={isReading} onPress={scanDocument} style={({ pressed }) => [styles.homeButton, styles.cameraButton, pressed && styles.pressed]}>
           <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={96}/>
-          <ThemedText style={[styles.homeButtonText, { color: '#173B3F' }]}>Take picture</ThemedText>
+          <ThemedText style={[styles.homeButtonText, { color: '#173B3F' }]}>
+            {isReading ? 'Reading...' : 'Take picture'}
+          </ThemedText>
+          {ocrError && <ThemedText style={styles.ocrError}>{ocrError}</ThemedText>}
         </Pressable>
-      </View>
+      </View>)}
 
-      <Modal animationType="slide" presentationStyle="fullScreen" visible={cameraOpen}>
-        <ThemedView style={styles.cameraScreen}>
-          {capturedUri ? (<View style={[
-                styles.previewContainer,
-                {
-                    paddingTop: insets.top + Spacing.two,
-                    paddingBottom: insets.bottom + Spacing.three,
-                    paddingLeft: insets.left + Spacing.four,
-                    paddingRight: insets.right + Spacing.four,
-                },
-            ]}>
-              <View style={styles.previewHeader}>
-                <Pressable accessibilityLabel="Retake document photo" accessibilityRole="button" onPress={() => setCapturedUri(null)} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}>
-                  <SymbolView name={{ ios: 'arrow.counterclockwise', android: 'refresh', web: 'refresh' }} tintColor="#FFFFFF" size={21}/>
-                </Pressable>
-                <ThemedText style={styles.cameraTitle}>Check your document</ThemedText>
-                <Pressable accessibilityLabel="Close document scanner" accessibilityRole="button" onPress={closeCamera} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}>
-                  <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor="#FFFFFF" size={21}/>
-                </Pressable>
-              </View>
-              <Image source={{ uri: capturedUri }} style={styles.previewImage} resizeMode="contain"/>
-              <View style={styles.previewActions}>
-                <ThemedText style={styles.previewHint}>Make sure all the text is in focus.</ThemedText>
-                <Pressable accessibilityLabel="Use this document" accessibilityRole="button" disabled={isReading} onPress={readDocument} style={({ pressed }) => [styles.usePhotoButton, pressed && styles.pressed]}>
-                  <ThemedText style={styles.usePhotoText}>
-                    {isReading ? 'Reading document...' : 'Read this document'}
-                  </ThemedText>
-                </Pressable>
-                {ocrError && <ThemedText style={styles.ocrError}>{ocrError}</ThemedText>}
-              </View>
-            </View>) : (<View style={styles.cameraContainer}>
-              <CameraView ref={cameraRef} style={styles.camera} facing="back" mode="picture"/>
-              <View style={[
-                styles.cameraOverlay,
-                {
-                    paddingTop: insets.top + Spacing.two,
-                    paddingBottom: insets.bottom + Spacing.four,
-                    paddingLeft: insets.left,
-                    paddingRight: insets.right,
-                },
-            ]} pointerEvents="box-none">
-                <View style={styles.cameraHeader}>
-                  <ThemedText style={styles.cameraTitle}>Scan a document</ThemedText>
-                  <Pressable accessibilityLabel="Close document scanner" accessibilityRole="button" onPress={closeCamera} style={({ pressed }) => [styles.cameraCloseButton, pressed && styles.pressed]}>
-                    <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor="#FFFFFF" size={21}/>
-                  </Pressable>
-                </View>
-                <View style={styles.scanFrame}/>
-                <ThemedText style={styles.cameraHint}>Fit the whole document inside the frame</ThemedText>
-                <Pressable accessibilityLabel="Take document photo" accessibilityRole="button" onPress={captureDocument} style={({ pressed }) => [styles.shutterButton, pressed && styles.pressed]}>
-                  <View style={styles.shutterInner}/>
-                </Pressable>
-              </View>
-            </View>)}
-        </ThemedView>
-      </Modal>
-
-      <Modal animationType="slide" visible={recognizedText !== null}>
-        <View style={[
+      <Modal animationType="slide" visible={readerOpen} onRequestClose={closeReader}>
+        {/* VoiceOver: two-finger double tap (Magic Tap) asks a question from
+            anywhere, and the two-finger "Z" scrub closes the reader. */}
+        <View accessibilityViewIsModal onMagicTap={toggleAsk} onAccessibilityEscape={closeReader} style={[
             styles.readerScreen,
             {
                 backgroundColor: theme.background,
-                paddingTop: insets.top,
-                paddingLeft: insets.left + Spacing.four,
-                paddingRight: insets.right + Spacing.four,
+                paddingTop: insets.top + Spacing.three,
+                paddingBottom: insets.bottom + Spacing.three,
+                paddingLeft: insets.left + Spacing.three,
+                paddingRight: insets.right + Spacing.three,
             },
         ]}>
-          <View style={styles.readerHeader}>
-            <View>
-              <ThemedText type="small" themeColor="textSecondary" style={styles.eyebrow}>
-                DOCUMENT TEXT
-              </ThemedText>
-              <ThemedText style={styles.readerTitle}>Your document</ThemedText>
-            </View>
-            <Pressable accessibilityLabel="Close reading view" accessibilityRole="button" onPress={closeReader} style={({ pressed }) => [styles.readerCloseButton, { backgroundColor: theme.backgroundSelected }, pressed && styles.pressed]}>
-              <SymbolView name={{ ios: 'xmark', android: 'close', web: 'close' }} tintColor={theme.text} size={21}/>
-            </Pressable>
-          </View>
-
-          <Pressable accessibilityRole="button" accessibilityLabel={isSpeaking ? 'Stop reading' : 'Read aloud'} accessibilityHint={isSpeaking ? 'Stops the voice reading immediately' : 'Reads the whole document out loud'} onPress={isSpeaking ? handleStopSpeaking : readWholePage} style={({ pressed }) => [styles.readAloudButton, isSpeaking && styles.readAloudButtonStop, pressed && styles.pressed]}>
-            <SymbolView name={isSpeaking
-            ? { ios: 'stop.fill', android: 'stop', web: 'stop' }
-            : { ios: 'speaker.wave.2.fill', android: 'volume_up', web: 'volume_up' }} tintColor="#FFFFFF" size={28}/>
-            <ThemedText style={styles.readAloudText}>{isSpeaking ? 'Stop reading' : 'Read aloud'}</ThemedText>
+          <Pressable accessibilityRole="button" accessibilityLabel={askLabel} accessibilityHint={askHint} onPress={toggleAsk} style={({ pressed }) => [
+            styles.askButton,
+            voice.isListening && styles.askButtonListening,
+            isSpeaking && !voice.isListening && styles.askButtonSpeaking,
+            pressed && styles.pressed,
+        ]}>
+            <SymbolView name={voice.isListening
+            ? { ios: 'waveform', android: 'graphic_eq', web: 'graphic_eq' }
+            : isSpeaking
+                ? { ios: 'stop.fill', android: 'stop', web: 'stop' }
+                : { ios: 'mic.fill', android: 'mic', web: 'mic' }} tintColor="#FFFFFF" size={88}/>
+            <ThemedText style={styles.askTitle}>{askTitle}</ThemedText>
+            <ThemedText style={styles.askSubtitle}>{askSubtitle}</ThemedText>
           </Pressable>
 
-          <ScrollView contentContainerStyle={[styles.readerContent, { paddingBottom: insets.bottom + Spacing.six }]} accessibilityLabel="Recognized document text">
-            <ThemedView type="backgroundElement" style={styles.askSection}>
-              <ThemedText style={styles.askSectionTitle}>Ask about this document</ThemedText>
+          {voiceUnavailable && (<View style={styles.fallbackRow}>
+              <FallbackButton label="Amount due" icon={{ ios: 'dollarsign.circle.fill', android: 'attach_money', web: 'attach_money' }} onPress={() => runCommand({ type: 'field', fields: ['amountDue'] })}/>
+              <FallbackButton label="Due date" icon={{ ios: 'calendar', android: 'event', web: 'event' }} onPress={() => runCommand({ type: 'field', fields: ['dueDate'] })}/>
+              <FallbackButton label="Read all" icon={{ ios: 'text.alignleft', android: 'subject', web: 'subject' }} onPress={() => runCommand({ type: 'readAll' })}/>
+            </View>)}
 
-              <View style={styles.toggleRow}>
-                <ThemedText type="small" themeColor="textSecondary">
-                  Answer length
-                </ThemedText>
-                <Pressable accessibilityRole="switch" accessibilityLabel="Answer length" accessibilityState={{ checked: answerMode === 'full' }} accessibilityValue={{ text: answerMode === 'short' ? 'Short answer' : 'Full answer' }} accessibilityHint="Double tap to switch between a short answer and a full sentence" onPress={() => setAnswerMode((mode) => (mode === 'short' ? 'full' : 'short'))} style={({ pressed }) => [styles.toggleTrack, { backgroundColor: theme.background }, pressed && styles.pressed]}>
-                  <View style={[styles.toggleOption, answerMode === 'short' && { backgroundColor: theme.backgroundSelected }]}>
-                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
-                      Short answer
-                    </ThemedText>
-                  </View>
-                  <View style={[styles.toggleOption, answerMode === 'full' && { backgroundColor: theme.backgroundSelected }]}>
-                    <ThemedText type="smallBold" style={styles.toggleOptionText}>
-                      Full answer
-                    </ThemedText>
-                  </View>
-                </Pressable>
-              </View>
+          {answer && (<ScrollView style={styles.answerScroll} accessibilityLabel="Last answer">
+              <ThemedView type="backgroundElement" style={styles.answerCard}>
+                <ThemedText style={styles.answerText}>{answer}</ThemedText>
+              </ThemedView>
+            </ScrollView>)}
 
-              <View style={styles.fieldButtonRow}>
-                <Pressable accessibilityRole="button" accessibilityLabel="Amount due" accessibilityHint="Finds and speaks the amount you owe on this document" onPress={() => handleField('amountDue')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
-                  <SymbolView name={{ ios: 'dollarsign.circle.fill', android: 'attach_money', web: 'attach_money' }} tintColor="#FFFFFF" size={22}/>
-                  <ThemedText style={styles.fieldButtonText}>Amount due</ThemedText>
-                </Pressable>
-                <Pressable accessibilityRole="button" accessibilityLabel="Due date" accessibilityHint="Finds and speaks the date this bill is due" onPress={() => handleField('dueDate')} style={({ pressed }) => [styles.fieldButton, pressed && styles.pressed]}>
-                  <SymbolView name={{ ios: 'calendar', android: 'event', web: 'event' }} tintColor="#FFFFFF" size={22}/>
-                  <ThemedText style={styles.fieldButtonText}>Due date</ThemedText>
-                </Pressable>
-              </View>
-
-              {fieldAnswer && (
-                <ThemedView style={[styles.answerCard, fieldAnswer.confidence === 'low' && styles.answerCardLow]} accessibilityLabel={`${FIELD_LABELS[fieldAnswer.field]}: ${fieldAnswer.text}`}>
-                  <ThemedText style={[styles.answerText, fieldAnswer.confidence === 'low' && styles.answerTextLow]}>{fieldAnswer.text}</ThemedText>
-                </ThemedView>
-              )}
-            </ThemedView>
-
-            <ThemedText type="smallBold" themeColor="textSecondary" style={styles.rawTextLabel}>
-              DOCUMENT
-            </ThemedText>
-            <ThemedView type="backgroundElement" style={styles.documentCard}>
-              {documentBlocks.map((block, index) => {
-                if (block.type === 'heading') {
-                    return (<ThemedText key={index} accessibilityRole="header" style={styles.docHeading}>
-                      {block.text}
-                    </ThemedText>);
-                }
-                if (block.type === 'fields') {
-                    return (<View key={index} style={styles.docFields}>
-                      {block.items.map((item, itemIndex) => (<View key={itemIndex} style={[styles.docField, itemIndex > 0 && { borderTopColor: theme.backgroundSelected, borderTopWidth: 1 }]}>
-                          <ThemedText type="small" themeColor="textSecondary" style={styles.docFieldLabel}>
-                            {item.label}
-                          </ThemedText>
-                          <ThemedText style={styles.docFieldValue}>{item.value}</ThemedText>
-                        </View>))}
-                    </View>);
-                }
-                return (<ThemedText key={index} style={styles.docParagraph}>
-                    {block.lines.join('\n')}
-                  </ThemedText>);
-            })}
-            </ThemedView>
-          </ScrollView>
+          <Pressable accessibilityRole="button" accessibilityLabel="Scan a new document" accessibilityHint="Closes this document and opens the scanner" onPress={() => runCommand({ type: 'scan' })} style={({ pressed }) => [styles.scanNewButton, pressed && styles.pressed]}>
+            <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={28}/>
+            <ThemedText style={styles.scanNewText}>Scan new document</ThemedText>
+          </Pressable>
         </View>
       </Modal>
     </ThemedView>);
 }
+
+function FallbackButton({ label, icon, onPress }) {
+    return (<Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} style={({ pressed }) => [styles.fallbackButton, pressed && styles.pressed]}>
+      <SymbolView name={icon} tintColor="#FFFFFF" size={26}/>
+      <ThemedText style={styles.fallbackText}>{label}</ThemedText>
+    </Pressable>);
+}
+
 const styles = StyleSheet.create({
     container: {
         flex: 1,
     },
-    eyebrow: {
-        fontSize: 11,
-        lineHeight: 16,
-        letterSpacing: 1.2,
-        fontWeight: '700',
-    },
     pressed: {
         opacity: 0.72,
     },
-    cameraScreen: {
-        flex: 1,
-        backgroundColor: '#101A1B',
-    },
-    cameraContainer: {
-        flex: 1,
-        position: 'relative',
-    },
-    camera: {
-        flex: 1,
-    },
-    cameraOverlay: {
-        ...StyleSheet.absoluteFill,
-        alignItems: 'center',
-        justifyContent: 'space-between',
-    },
-    cameraHeader: {
-        width: '100%',
-        paddingHorizontal: Spacing.four,
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-    },
-    cameraTitle: {
-        color: '#FFFFFF',
-        fontSize: 19,
-        lineHeight: 25,
-        fontWeight: '700',
-    },
-    cameraCloseButton: {
-        width: 44,
-        height: 44,
-        borderRadius: 22,
-        backgroundColor: 'rgba(16, 26, 27, 0.7)',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    scanFrame: {
-        width: '78%',
-        aspectRatio: 0.7,
-        maxHeight: '55%',
-        borderWidth: 2,
-        borderColor: '#FFFFFF',
-        borderRadius: 16,
-    },
-    cameraHint: {
-        color: '#FFFFFF',
-        backgroundColor: 'rgba(16, 26, 27, 0.7)',
-        borderRadius: 12,
-        paddingHorizontal: Spacing.three,
-        paddingVertical: Spacing.two,
-        overflow: 'hidden',
-    },
-    shutterButton: {
-        width: 78,
-        height: 78,
-        borderRadius: 39,
-        borderWidth: 5,
-        borderColor: '#FFFFFF',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    shutterInner: {
-        width: 62,
-        height: 62,
-        borderRadius: 31,
-        backgroundColor: '#FFFFFF',
-    },
-    previewContainer: {
-        flex: 1,
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: Spacing.four,
-    },
-    previewImage: {
-        width: '100%',
-        flex: 1,
-    },
-    previewHeader: {
-        width: '100%',
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-    },
-    previewActions: {
-        width: '100%',
-        alignItems: 'center',
-        gap: Spacing.three,
-    },
-    previewHint: {
-        color: '#B9C9C8',
-        textAlign: 'center',
-    },
-    usePhotoButton: {
-        minHeight: 56,
-        alignSelf: 'stretch',
-        borderRadius: 16,
-        backgroundColor: '#D9EEE7',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    usePhotoText: {
-        color: '#173B3F',
-        fontSize: 16,
-        lineHeight: 22,
-        fontWeight: '700',
-    },
     ocrError: {
-        color: '#F2A494',
+        color: '#7A1C14',
+        fontSize: 18,
+        lineHeight: 24,
+        fontWeight: '700',
         textAlign: 'center',
+        paddingHorizontal: Spacing.four,
     },
     readerScreen: {
         flex: 1,
-    },
-    readerHeader: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        paddingVertical: Spacing.three,
-    },
-    readerTitle: {
-        fontSize: 29,
-        lineHeight: 35,
-        fontWeight: '700',
-    },
-    readerCloseButton: {
-        width: 44,
-        height: 44,
-        borderRadius: 22,
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    readerContent: {
-        paddingTop: Spacing.three,
-    },
-    askSection: {
-        borderRadius: 20,
-        padding: Spacing.four,
-        gap: Spacing.four,
-    },
-    rawTextLabel: {
-        marginTop: Spacing.five,
-        fontSize: 12,
-        letterSpacing: 1,
-    },
-    askSectionTitle: {
-        fontSize: 19,
-        lineHeight: 26,
-        fontWeight: '700',
-    },
-    toggleRow: {
-        gap: Spacing.two,
-    },
-    toggleTrack: {
-        flexDirection: 'row',
-        minHeight: 48,
-        borderRadius: 14,
-        padding: Spacing.half,
-        gap: Spacing.half,
-    },
-    toggleOption: {
-        flex: 1,
-        minHeight: 44,
-        borderRadius: 11,
-        alignItems: 'center',
-        justifyContent: 'center',
-        paddingHorizontal: Spacing.two,
-    },
-    toggleOptionText: {
-        fontSize: 14,
-        lineHeight: 20,
-    },
-    fieldButtonRow: {
-        flexDirection: 'row',
-        flexWrap: 'wrap',
         gap: Spacing.three,
     },
-    fieldButton: {
-        flexGrow: 1,
-        flexBasis: 140,
-        minHeight: 56,
-        borderRadius: 16,
-        paddingHorizontal: Spacing.three,
-        paddingVertical: Spacing.two,
+    askButton: {
+        flex: 1,
+        minHeight: 260,
+        borderRadius: 32,
         backgroundColor: '#173B3F',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.three,
+        padding: Spacing.four,
+    },
+    askButtonListening: {
+        backgroundColor: '#0B6E4F',
+    },
+    askButtonSpeaking: {
+        backgroundColor: '#8C1D18',
+    },
+    askTitle: {
+        color: '#FFFFFF',
+        fontSize: 44,
+        lineHeight: 52,
+        fontWeight: '800',
+        textAlign: 'center',
+    },
+    askSubtitle: {
+        color: '#FFFFFF',
+        fontSize: 22,
+        lineHeight: 30,
+        fontWeight: '600',
+        textAlign: 'center',
+    },
+    fallbackRow: {
+        flexDirection: 'row',
+        gap: Spacing.two,
+    },
+    fallbackButton: {
+        flex: 1,
+        minHeight: 88,
+        borderRadius: 20,
+        backgroundColor: '#173B3F',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.one,
+        padding: Spacing.two,
+    },
+    fallbackText: {
+        color: '#FFFFFF',
+        fontSize: 18,
+        lineHeight: 24,
+        fontWeight: '700',
+        textAlign: 'center',
+    },
+    answerScroll: {
+        flexGrow: 0,
+        maxHeight: '40%',
+    },
+    answerCard: {
+        borderRadius: 20,
+        padding: Spacing.four,
+    },
+    answerText: {
+        fontSize: 28,
+        lineHeight: 38,
+        fontWeight: '700',
+    },
+    scanNewButton: {
+        minHeight: 72,
+        borderRadius: 20,
+        backgroundColor: '#F5C36A',
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: Spacing.two,
+        gap: Spacing.three,
     },
-    fieldButtonText: {
-        color: '#FFFFFF',
-        fontSize: 16,
-        lineHeight: 22,
+    scanNewText: {
+        color: '#173B3F',
+        fontSize: 22,
+        lineHeight: 28,
+        fontWeight: '800',
+    },
+    confirmView: {
+        flex: 1,
+        paddingHorizontal: Spacing.three,
+        gap: Spacing.three,
+    },
+    confirmTitle: {
+        fontSize: 36,
+        lineHeight: 44,
+        fontWeight: '800',
+        textAlign: 'center',
+    },
+    confirmSubtitle: {
+        fontSize: 22,
+        lineHeight: 30,
+        fontWeight: '600',
+        textAlign: 'center',
+    },
+    confirmImage: {
+        flex: 1,
+        minHeight: 120,
+    },
+    confirmButton: {
+        minHeight: 110,
+        borderRadius: 28,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: Spacing.three,
+    },
+    confirmButtonText: {
+        fontSize: 30,
+        lineHeight: 38,
+        fontWeight: '800',
+    },
+    cancelButton: {
+        minHeight: 64,
+        borderRadius: 20,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    cancelButtonText: {
+        fontSize: 22,
+        lineHeight: 28,
         fontWeight: '700',
-        flexShrink: 1,
-    },
-    answerCard: {
-        borderRadius: 16,
-        borderWidth: 2,
-        borderColor: '#B9DDD1',
-        padding: Spacing.four,
-    },
-    answerCardLow: {
-        borderColor: '#9A6414',
-        backgroundColor: '#F9E7B7',
-    },
-    answerText: {
-        fontSize: 26,
-        lineHeight: 34,
-        fontWeight: '700',
-    },
-    answerTextLow: {
-        color: '#3D2A06',
     },
     homeButtons: {
         flex: 1,
@@ -547,55 +521,5 @@ const styles = StyleSheet.create({
         fontSize: 40,
         lineHeight: 48,
         fontWeight: '800',
-    },
-    readAloudButton: {
-        minHeight: 72,
-        marginBottom: Spacing.three,
-        borderRadius: 20,
-        backgroundColor: '#173B3F',
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: Spacing.three,
-    },
-    readAloudButtonStop: {
-        backgroundColor: '#B3261E',
-    },
-    readAloudText: {
-        color: '#FFFFFF',
-        fontSize: 22,
-        lineHeight: 28,
-        fontWeight: '700',
-    },
-    documentCard: {
-        marginTop: Spacing.two,
-        borderRadius: 20,
-        padding: Spacing.four,
-        gap: Spacing.three,
-    },
-    docHeading: {
-        fontSize: 20,
-        lineHeight: 26,
-        fontWeight: '700',
-        marginTop: Spacing.one,
-    },
-    docFields: {
-        gap: 0,
-    },
-    docField: {
-        paddingVertical: Spacing.two,
-        gap: Spacing.half,
-    },
-    docFieldLabel: {
-        fontWeight: '600',
-    },
-    docFieldValue: {
-        fontSize: 18,
-        lineHeight: 24,
-        fontWeight: '700',
-    },
-    docParagraph: {
-        fontSize: 17,
-        lineHeight: 26,
     },
 });
