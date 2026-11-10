@@ -1,8 +1,8 @@
-import * as Haptics from 'expo-haptics';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AccessibilityInfo, Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { AccessibilityInfo, AppState, Image, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { DocumentCamera } from '@/components/document-camera';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, Spacing } from '@/constants/theme';
@@ -11,22 +11,44 @@ import { useVoiceQuestion } from '@/hooks/use-voice-question';
 import { interpret, introSpeech, respond } from '@/services/assistant';
 import { parseConfirmation } from '@/services/commands';
 import { documentToSpeech, structureDocument } from '@/services/document';
+import { problemFeedback, tapFeedback, yourTurnFeedback } from '@/services/feedback';
+import { isTextClear } from '@/services/framing';
 import { recognizeDocumentText } from '@/services/ocr';
-import { scanDocumentImage } from '@/services/scanner';
 import { speak, stopSpeaking } from '@/services/speech';
 
-const HOME_HELP = 'To read a document, say: scan a document. Or tap the Take picture button at the bottom of the screen.';
+const TAKE_A_PICTURE = 'To read a document, say: take a picture.';
+const WELCOME = `Welcome to Readify. ${TAKE_A_PICTURE}`;
+const HOME_HELP = `${TAKE_A_PICTURE} You can also tap the Take picture button at the bottom of the screen.`;
+const HOME_UNKNOWN = `Sorry, I did not catch that. ${TAKE_A_PICTURE}`;
+const READER_CLOSED = `Okay, you are back on the home screen. ${TAKE_A_PICTURE}`;
+const READER_DELETED = `Document deleted. You are back on the home screen. ${TAKE_A_PICTURE}`;
+const VOICE_PAUSED = 'I am having trouble listening, so voice control is paused. ' +
+    'To turn it back on, tap the Speak button at the top of the screen.';
+const PHOTO_TAKEN = 'Your photo has been taken.';
+const PHOTO_UNCLEAR = 'The photo is unclear. Please take it again.';
+// Added after the second unclear photo in a row.
+const UNCLEAR_TIP = 'Try turning on a light, or moving the page somewhere brighter.';
 const VOICE_UNAVAILABLE =
     'Voice questions are turned off, because Readify cannot use the microphone or speech recognition. ' +
     'You can turn them on in Settings. For now, use the buttons on the screen.';
 
-const CONFIRM_QUESTION = 'Do you want me to read this document? Say yes or no.';
-// How many times to ask again when the yes/no answer isn't heard, before
-// leaving it to the buttons.
+const CONFIRM_QUESTION = 'Would you like to read this document? Say yes or no.';
+// How many times to ask again when no yes/no answer is heard. After that the
+// app keeps listening quietly instead of nagging.
 const MAX_CONFIRM_RETRIES = 2;
 
-// Gives the reader screen time to finish closing before the scanner opens
-// on top of it; iOS won't present the scanner over a closing screen.
+// Readify listens on its own whenever it isn't talking, so the user never
+// has to press a button. This pause after it stops talking keeps the tail of
+// its own voice from being heard as a command.
+// Kept short because people answer a question straight away, and anything
+// said before the microphone opens is lost.
+const RELISTEN_DELAY_MS = 250;
+// Listening errors in a row (other than silence) before voice control pauses,
+// so a broken microphone doesn't cause an endless loop of error messages.
+const MAX_LISTEN_ERRORS = 3;
+
+// Gives a screen time to finish closing before the camera opens on top of
+// it; iOS won't present a new screen over one that is still closing.
 const REOPEN_SCANNER_DELAY_MS = 600;
 
 export default function HomeScreen() {
@@ -35,11 +57,27 @@ export default function HomeScreen() {
     const [recognizedText, setRecognizedText] = useState(null);
     const [isReading, setIsReading] = useState(false);
     const [ocrError, setOcrError] = useState(null);
-    const [isSpeaking, setIsSpeaking] = useState(false);
+    // Starts true: the welcome message plays as soon as the app opens.
+    const [isSpeaking, setIsSpeaking] = useState(true);
+    const [appActive, setAppActive] = useState(true);
+    // Set after repeated listening errors; tapping Speak turns it back on.
+    const [voicePaused, setVoicePaused] = useState(false);
+    const listenErrorsRef = useRef(0);
+    // Set whenever Readify speaks, so the next time the microphone opens it
+    // gives a "your turn" tap. Not on the quiet restarts after silence.
+    const justSpokeRef = useRef(true);
+    // The last thing the recognizer heard, shown on the yes/no screen.
+    const [lastHeard, setLastHeard] = useState('');
     const [answer, setAnswer] = useState(null);
     const [lastSpeech, setLastSpeech] = useState(null);
     const [voiceUnavailable, setVoiceUnavailable] = useState(false);
     const [screenReaderOn, setScreenReaderOn] = useState(false);
+    const [cameraOpen, setCameraOpen] = useState(false);
+    // True between the photo being taken and knowing whether it's clear.
+    const [isChecking, setIsChecking] = useState(false);
+    // True while waiting for the reader to close before the camera opens.
+    const [cameraOpening, setCameraOpening] = useState(false);
+    const unclearCountRef = useRef(0);
     // A scanned page waiting for the user to confirm they want it read.
     const [pendingUri, setPendingUri] = useState(null);
     // Text recognition for the pending page, started as soon as it's taken
@@ -55,6 +93,11 @@ export default function HomeScreen() {
         return () => subscription.remove();
     }, []);
 
+    useEffect(() => {
+        const finished = () => setIsSpeaking(false);
+        speak(WELCOME, { onDone: finished, onStopped: finished, onError: finished });
+    }, []);
+
     /**
      * Speaks `text`. If `display` is given it also becomes the answer shown
      * on screen, and is what "repeat" says again. `onFinished` runs only if
@@ -65,6 +108,9 @@ export default function HomeScreen() {
             setAnswer(display);
             setLastSpeech(text);
         }
+        // Never listen while talking, or Readify hears itself.
+        voice.cancel();
+        justSpokeRef.current = true;
         setIsSpeaking(true);
         speak(text, {
             onDone: () => {
@@ -75,48 +121,74 @@ export default function HomeScreen() {
             onError: () => setIsSpeaking(false),
         });
     };
+    // Speaks `text` and resolves once it has finished, been stopped, or failed.
+    const sayAndWait = (text) => new Promise((resolve) => {
+        const finished = () => {
+            setIsSpeaking(false);
+            resolve();
+        };
+        voice.cancel();
+        justSpokeRef.current = true;
+        setIsSpeaking(true);
+        speak(text, { onDone: finished, onStopped: finished, onError: finished });
+    });
     const handleStopSpeaking = () => {
         stopSpeaking();
         setIsSpeaking(false);
     };
 
-    const scanDocument = async () => {
-        if (isReading)
+    // Opens the guided camera. It talks the user into lining up the page and
+    // takes one photo, which arrives in handlePhotoTaken.
+    const scanDocument = () => {
+        if (isReading || isChecking)
             return;
         voice.cancel();
         handleStopSpeaking();
         setOcrError(null);
         setPendingUri(null);
         pendingTextRef.current = null;
-        let uri;
-        try {
-            uri = await scanDocumentImage();
-        }
-        catch {
-            reportScanError('The scanner could not start. Please try again.');
+        setCameraOpen(true);
+    };
+    const handlePhotoTaken = async (uri) => {
+        setCameraOpen(false);
+        setIsChecking(true);
+        // The camera already buzzed at the moment the photo was taken.
+        // Read the text while the confirmation is being said, so the clarity
+        // check is usually done by the time it finishes.
+        const [, result] = await Promise.all([
+            sayAndWait(PHOTO_TAKEN),
+            recognizeDocumentText(uri).then((text) => ({ text, failed: false }), () => ({ text: '', failed: true })),
+        ]);
+        setIsChecking(false);
+        if (result.failed || !isTextClear(result.text)) {
+            unclearCountRef.current += 1;
+            problemFeedback();
+            const message = unclearCountRef.current >= 2 ? `${PHOTO_UNCLEAR} ${UNCLEAR_TIP}` : PHOTO_UNCLEAR;
+            // The camera screen closed long ago, so it can reopen straight
+            // away, before listening would start.
+            say(message, undefined, scanDocument);
             return;
         }
-        if (!uri) {
-            say('Scanning cancelled.');
-            return;
-        }
-        pendingTextRef.current = recognizeDocumentText(uri).then((text) => ({ text, failed: false }), () => ({ text: '', failed: true }));
+        unclearCountRef.current = 0;
+        pendingTextRef.current = Promise.resolve(result);
         confirmRetriesRef.current = 0;
+        setLastHeard('');
         setPendingUri(uri);
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        askToReadPending(`Picture taken. ${CONFIRM_QUESTION}`);
+        say(CONFIRM_QUESTION);
     };
-    // Asks the yes/no question, then listens for the answer once it's been said.
-    const askToReadPending = (question) => {
-        say(question, undefined, () => voice.listen());
+    const handleCameraCancel = () => {
+        setCameraOpen(false);
+        unclearCountRef.current = 0;
+        say(`Camera closed. ${TAKE_A_PICTURE}`);
     };
+    const handleCameraError = (message) => {
+        setCameraOpen(false);
+        reportScanError(message);
+    };
+    // The answer is picked up by the automatic listening once this is said.
     const askToReadPendingAgain = (reason) => {
         confirmRetriesRef.current += 1;
-        if (confirmRetriesRef.current > MAX_CONFIRM_RETRIES) {
-            say(`${reason} You can use the buttons on the screen instead. Read this document is at the top.`);
-            return;
-        }
-        askToReadPending(`${reason} ${CONFIRM_QUESTION}`);
+        say(`${reason} ${CONFIRM_QUESTION}`);
     };
     const readPendingDocument = async () => {
         const pending = pendingTextRef.current;
@@ -127,7 +199,6 @@ export default function HomeScreen() {
         handleStopSpeaking();
         setPendingUri(null);
         setIsReading(true);
-        say('Reading your document.');
         const { text, failed } = await pending;
         setIsReading(false);
         if (failed) {
@@ -141,13 +212,13 @@ export default function HomeScreen() {
         setAnswer(null);
         setLastSpeech(null);
         setRecognizedText(text);
-        say(introSpeech(screenReaderOn));
+        say(introSpeech());
     };
     const cancelPendingDocument = () => {
         pendingTextRef.current = null;
         voice.cancel();
         setPendingUri(null);
-        say('Okay. The picture was not read.');
+        say(`Okay, that photo was discarded. ${TAKE_A_PICTURE}`);
     };
     const handleConfirmation = (transcripts) => {
         const confirmation = transcripts.map(parseConfirmation).find(Boolean);
@@ -161,7 +232,10 @@ export default function HomeScreen() {
             cancelPendingDocument();
         }
         else {
-            askToReadPendingAgain('Sorry, I did not catch that.');
+            // Saying back what was heard tells the user why it didn't work
+            // (e.g. "yes" heard as "guess").
+            const heard = transcripts[0];
+            askToReadPendingAgain(heard ? `Sorry, I heard: ${heard}.` : 'Sorry, I did not catch that.');
         }
     };
     const reportScanError = (message) => {
@@ -176,17 +250,28 @@ export default function HomeScreen() {
         setLastSpeech(null);
         setRecognizedText(null);
     };
+    // Closes the document (nothing is kept) and says where the user is now.
+    const leaveReader = (message) => {
+        closeReader();
+        say(message);
+    };
 
     const runCommand = (command) => {
         if (!readerOpen) {
-            if (command.type === 'scan') {
-                scanDocument();
-            }
-            else if (command.type === 'stop') {
-                handleStopSpeaking();
-            }
-            else {
-                say(HOME_HELP);
+            switch (command.type) {
+                // "Read a document" on the home screen means take a picture.
+                case 'scan':
+                case 'readAll':
+                    scanDocument();
+                    break;
+                case 'stop':
+                    handleStopSpeaking();
+                    break;
+                case 'help':
+                    say(HOME_HELP);
+                    break;
+                default:
+                    say(HOME_UNKNOWN);
             }
             return;
         }
@@ -199,18 +284,27 @@ export default function HomeScreen() {
                 handleStopSpeaking();
                 break;
             case 'close':
-                closeReader();
+                leaveReader(READER_CLOSED);
+                break;
+            case 'delete':
+                leaveReader(READER_DELETED);
                 break;
             case 'scan':
                 closeReader();
-                setTimeout(scanDocument, REOPEN_SCANNER_DELAY_MS);
+                setCameraOpening(true);
+                setTimeout(() => {
+                    setCameraOpening(false);
+                    scanDocument();
+                }, REOPEN_SCANNER_DELAY_MS);
                 break;
         }
     };
 
     const voice = useVoiceQuestion({
         onResult: (transcripts) => {
-            Haptics.selectionAsync();
+            listenErrorsRef.current = 0;
+            tapFeedback();
+            setLastHeard(transcripts[0] ?? '');
             if (pendingUri) {
                 handleConfirmation(transcripts);
                 return;
@@ -218,38 +312,88 @@ export default function HomeScreen() {
             runCommand(interpret(transcripts).command);
         },
         onError: (reason) => {
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-            const voiceOff = ['not-allowed', 'service-not-allowed', 'unavailable', 'language-not-supported'].includes(reason);
-            if (pendingUri && !voiceOff) {
-                askToReadPendingAgain(reason === 'no-speech' || reason === 'speech-timeout'
-                    ? 'I did not hear an answer.'
-                    : 'Sorry, something went wrong while listening.');
+            // Nobody spoke. Normal when listening all the time: just listen
+            // again, apart from re-asking an unanswered yes/no question a
+            // couple of times.
+            if (reason === 'no-speech' || reason === 'speech-timeout') {
+                listenErrorsRef.current = 0;
+                if (pendingUri && confirmRetriesRef.current < MAX_CONFIRM_RETRIES) {
+                    askToReadPendingAgain('I did not hear an answer.');
+                }
+                return;
             }
-            else if (voiceOff) {
+            problemFeedback();
+            if (['not-allowed', 'service-not-allowed', 'unavailable', 'language-not-supported'].includes(reason)) {
                 setVoiceUnavailable(true);
                 say(VOICE_UNAVAILABLE);
+                return;
             }
-            else if (reason === 'no-speech' || reason === 'speech-timeout') {
-                say('I did not hear a question.');
+            listenErrorsRef.current += 1;
+            if (listenErrorsRef.current >= MAX_LISTEN_ERRORS) {
+                setVoicePaused(true);
+                say(VOICE_PAUSED);
             }
-            else {
-                say('Sorry, something went wrong while listening. Please try again.');
-            }
+            // Otherwise the automatic listening just tries again.
         },
     });
 
-    // The one main action: stop anything being said and listen for a question.
-    // Tapping again while listening finishes the question early.
+    // Listen whenever Readify is waiting for the user: not talking, not in
+    // the camera, and not busy checking or opening a photo.
+    const shouldListen = appActive && !voiceUnavailable && !voicePaused && !cameraOpen && !cameraOpening && !isChecking && !isReading && !isSpeaking && !voice.isListening;
+    // The latest `voice`, for effects that shouldn't re-run on every render.
+    const voiceRef = useRef(voice);
+    useEffect(() => {
+        voiceRef.current = voice;
+    });
+    useEffect(() => {
+        if (!shouldListen) {
+            return;
+        }
+        const timer = setTimeout(() => {
+            if (justSpokeRef.current) {
+                justSpokeRef.current = false;
+                yourTurnFeedback();
+            }
+            voiceRef.current.listen();
+        }, RELISTEN_DELAY_MS);
+        return () => clearTimeout(timer);
+    }, [shouldListen]);
+    // Stop listening while the app is in the background.
+    useEffect(() => {
+        const subscription = AppState.addEventListener('change', (state) => {
+            const active = state === 'active';
+            setAppActive(active);
+            if (!active) {
+                voiceRef.current.cancel();
+            }
+        });
+        return () => subscription.remove();
+    }, []);
+
+    // The one main button. While Readify is talking it stops the talking
+    // (listening then starts again by itself); while listening it finishes
+    // the question early; if voice control was paused it turns it back on.
     const toggleAsk = () => {
+        tapFeedback();
         if (voice.isListening) {
             voice.stop();
             return;
         }
-        handleStopSpeaking();
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        if (isSpeaking) {
+            handleStopSpeaking();
+            return;
+        }
+        // Also retries after the microphone was unavailable (e.g. permission
+        // since turned on in Settings); if it still isn't, onError says so.
+        listenErrorsRef.current = 0;
+        setVoicePaused(false);
+        setVoiceUnavailable(false);
         voice.listen();
     };
 
+    const homeSpeakLabel = voicePaused || voiceUnavailable
+        ? 'Turn voice on'
+        : voice.isListening && !readerOpen ? 'Listening…' : 'Speak';
     const askTitle = voice.isListening ? 'Listening…' : isSpeaking ? 'Tap to stop' : 'Tap to ask';
     const askSubtitle = voice.isListening
         ? voice.transcript ? `“${voice.transcript}”` : 'Say what you want to know'
@@ -266,11 +410,14 @@ export default function HomeScreen() {
 
     return (<ThemedView style={styles.container}>
       {pendingUri ? (<View style={[styles.confirmView, homePadding]}>
-          <View accessible accessibilityRole="header" accessibilityLabel={`Picture taken. ${voice.isListening ? 'Listening. Say yes or no.' : 'Read this document?'}`}>
-            <ThemedText style={styles.confirmTitle}>Picture taken</ThemedText>
+          <View accessible accessibilityRole="header" accessibilityLabel={`Photo taken. ${voice.isListening ? 'Listening. Say yes or no.' : 'Would you like to read this document?'}`}>
+            <ThemedText style={styles.confirmTitle}>Photo taken</ThemedText>
             <ThemedText themeColor="textSecondary" style={styles.confirmSubtitle}>
-              {voice.isListening ? 'Listening… say yes or no' : 'Read this document?'}
+              {voice.isListening ? 'Listening… say yes or no' : 'Would you like to read this document?'}
             </ThemedText>
+            {lastHeard !== '' && (<ThemedText themeColor="textSecondary" style={styles.confirmSubtitle}>
+                Heard: “{lastHeard}”
+              </ThemedText>)}
           </View>
           <Image source={{ uri: pendingUri }} style={styles.confirmImage} resizeMode="contain"/>
           <Pressable accessibilityRole="button" accessibilityLabel="Yes, read this document" onPress={readPendingDocument} style={({ pressed }) => [styles.confirmButton, styles.speakButton, pressed && styles.pressed]}>
@@ -285,25 +432,27 @@ export default function HomeScreen() {
             <ThemedText style={styles.cancelButtonText}>Cancel</ThemedText>
           </Pressable>
         </View>) : (<View style={[styles.homeButtons, homePadding]}>
-        <Pressable accessibilityRole="button" accessibilityLabel={voice.isListening && !readerOpen ? 'Listening' : 'Speak'} accessibilityHint="Then say: scan a document" onPress={toggleAsk} style={({ pressed }) => [styles.homeButton, styles.speakButton, pressed && styles.pressed]}>
+        <Pressable accessibilityRole="button" accessibilityLabel={homeSpeakLabel} accessibilityHint={voicePaused || voiceUnavailable ? 'Turns voice control back on' : 'Readify is already listening. Just say: take a picture.'} onPress={toggleAsk} style={({ pressed }) => [styles.homeButton, styles.speakButton, pressed && styles.pressed]}>
           <SymbolView name={{ ios: 'mic.fill', android: 'mic', web: 'mic' }} tintColor="#FFFFFF" size={96}/>
           <ThemedText style={[styles.homeButtonText, { color: '#FFFFFF' }]}>
-            {voice.isListening && !readerOpen ? 'Listening…' : 'Speak'}
+            {homeSpeakLabel}
           </ThemedText>
         </Pressable>
-        <Pressable accessibilityRole="button" accessibilityLabel={isReading ? 'Reading document' : 'Take a picture'} accessibilityHint="Opens the document scanner" accessibilityState={{ busy: isReading, disabled: isReading }} disabled={isReading} onPress={scanDocument} style={({ pressed }) => [styles.homeButton, styles.cameraButton, pressed && styles.pressed]}>
+        <Pressable accessibilityRole="button" accessibilityLabel={isReading ? 'Reading document' : isChecking ? 'Checking photo' : 'Take a picture'} accessibilityHint="Opens the camera. Readify tells you how to move the phone, then takes the photo for you." accessibilityState={{ busy: isReading || isChecking, disabled: isReading || isChecking }} disabled={isReading || isChecking} onPress={scanDocument} style={({ pressed }) => [styles.homeButton, styles.cameraButton, pressed && styles.pressed]}>
           <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={96}/>
           <ThemedText style={[styles.homeButtonText, { color: '#173B3F' }]}>
-            {isReading ? 'Reading...' : 'Take picture'}
+            {isReading ? 'Reading...' : isChecking ? 'Checking...' : 'Take picture'}
           </ThemedText>
           {ocrError && <ThemedText style={styles.ocrError}>{ocrError}</ThemedText>}
         </Pressable>
       </View>)}
 
-      <Modal animationType="slide" visible={readerOpen} onRequestClose={closeReader}>
+      <DocumentCamera visible={cameraOpen} onCapture={handlePhotoTaken} onCancel={handleCameraCancel} onError={handleCameraError}/>
+
+      <Modal animationType="slide" visible={readerOpen} onRequestClose={() => leaveReader(READER_CLOSED)}>
         {/* VoiceOver: two-finger double tap (Magic Tap) asks a question from
             anywhere, and the two-finger "Z" scrub closes the reader. */}
-        <View accessibilityViewIsModal onMagicTap={toggleAsk} onAccessibilityEscape={closeReader} style={[
+        <View accessibilityViewIsModal onMagicTap={toggleAsk} onAccessibilityEscape={() => leaveReader(READER_CLOSED)} style={[
             styles.readerScreen,
             {
                 backgroundColor: theme.background,
@@ -340,7 +489,7 @@ export default function HomeScreen() {
               </ThemedView>
             </ScrollView>)}
 
-          <Pressable accessibilityRole="button" accessibilityLabel="Scan a new document" accessibilityHint="Closes this document and opens the scanner" onPress={() => runCommand({ type: 'scan' })} style={({ pressed }) => [styles.scanNewButton, pressed && styles.pressed]}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Scan a new document" accessibilityHint="Closes this document and opens the camera" onPress={() => runCommand({ type: 'scan' })} style={({ pressed }) => [styles.scanNewButton, pressed && styles.pressed]}>
             <SymbolView name={{ ios: 'camera.fill', android: 'photo_camera', web: 'camera' }} tintColor="#173B3F" size={28}/>
             <ThemedText style={styles.scanNewText}>Scan new document</ThemedText>
           </Pressable>

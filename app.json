@@ -11,10 +11,12 @@
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "com.readify.documentreader",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "Allow Readify to use your camera to take photos of documents"
       }
     },
     "android": {
+      "package": "com.readify.documentreader",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -49,9 +51,10 @@
         }
       ],
       [
-        "react-native-document-scanner-plugin",
+        "react-native-vision-camera-mlkit",
         {
-          "cameraPermission": "Allow Readify to use your camera to scan documents"
+          "textRecognition": true,
+          "barcodeScanning": true
         }
       ]
     ],

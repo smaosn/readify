@@ -11,7 +11,8 @@ import { extractField } from './extractor';
  * @typedef {{ type: 'say', speech: string, display: string }
  *   | { type: 'stop' }
  *   | { type: 'scan' }
- *   | { type: 'close' }} Reply
+ *   | { type: 'close' }
+ *   | { type: 'delete' }} Reply
  */
 
 const FIELD_NAMES = {
@@ -20,6 +21,7 @@ const FIELD_NAMES = {
 };
 
 const EXAMPLES = 'For example: what is the due date? Or: how much do I owe? You can also say: read everything.';
+const FINISHING = 'When you are finished, say: I am done. Or: delete this document.';
 
 /**
  * Speech recognizers return several guesses; use the first one that is a
@@ -38,12 +40,12 @@ export function interpret(transcripts) {
 }
 
 /**
- * @param {boolean} screenReaderOn
+ * Said when a document opens. The app is already listening afterwards, so
+ * the user just asks.
  * @returns {string}
  */
-export function introSpeech(screenReaderOn) {
-    const action = screenReaderOn ? 'Double tap the Ask button' : 'Tap the big button';
-    return `Your document is ready. ${action}, then ask your question. ${EXAMPLES}`;
+export function introSpeech() {
+    return `Your document is ready. Ask me a question. ${EXAMPLES} ${FINISHING}`;
 }
 
 /**
@@ -64,15 +66,18 @@ export function respond(command, { documentText, documentSpeech, lastSpeech, scr
                 ? { type: 'say', speech: lastSpeech, display: lastSpeech }
                 : say(`I have not read anything out yet. ${EXAMPLES}`);
         case 'help': {
+            // Voice can't interrupt the app while it talks (it would hear
+            // itself), so stopping it is still a tap.
             const tap = screenReaderOn ? 'double tap the Ask button' : 'tap the big button';
             return say(
                 `Ask me about this document. ${EXAMPLES} To stop me talking, ${tap}. ` +
-                    'To read a different document, say: scan a new document.'
+                    `To read a different document, say: scan a new document. ${FINISHING}`
             );
         }
         case 'stop':
         case 'scan':
         case 'close':
+        case 'delete':
             return { type: command.type };
         default:
             return say(`Sorry, I did not understand. ${EXAMPLES}`);

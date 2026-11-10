@@ -46,6 +46,17 @@ describe('parseCommand - other commands', () => {
         ['What can I say?', 'help'],
         ['Say that again', 'repeat'],
         ['Repeat', 'repeat'],
+        ['Take a photo', 'scan'],
+        ['Open the camera', 'scan'],
+        ['Scan a document', 'scan'],
+        ['I am done reading', 'close'],
+        ["I'm done", 'close'],
+        ["That's all", 'close'],
+        ['Go home', 'close'],
+        ['Delete this document', 'delete'],
+        ['Throw it away', 'delete'],
+        ["I'm done, delete it", 'delete'],
+        ['Delete this and scan another one', 'delete'],
     ])('"%s" -> %s', (said, type) => {
         expect(parseCommand(said).type).toBe(type);
     });
@@ -76,7 +87,7 @@ describe('parseCommand - other wordings for the fields', () => {
 });
 
 describe('parseConfirmation', () => {
-    test.each(['Yes', 'Yeah please', 'Okay', 'Sure', 'Read it', 'Go ahead', 'Yes read it now'])(
+    test.each(['Yes', 'Yes.', 'Yeah please', 'Okay', 'Sure', 'Read it', 'Go ahead', 'Yes read it now', 'Yea', 'Yess', 'Jess'])(
         '"%s" is yes',
         (said) => {
             expect(parseConfirmation(said)).toBe('yes');
@@ -90,7 +101,7 @@ describe('parseConfirmation', () => {
         }
     );
 
-    test.each(['Cancel', 'Never mind', 'Go back', 'Stop'])('"%s" is cancel', (said) => {
+    test.each(['Cancel', 'Never mind', 'Go back', 'Stop', 'Delete it', 'Go home'])('"%s" is cancel', (said) => {
         expect(parseConfirmation(said)).toBe('cancel');
     });
 

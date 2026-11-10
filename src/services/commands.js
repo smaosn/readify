@@ -7,6 +7,7 @@
  * @typedef {{ type: 'stop' }
  *   | { type: 'scan' }
  *   | { type: 'close' }
+ *   | { type: 'delete' }
  *   | { type: 'help' }
  *   | { type: 'repeat' }
  *   | { type: 'readAll' }
@@ -20,11 +21,31 @@ const SCAN_PHRASES = [
     'new document',
     'another document',
     'take a picture',
+    'take a photo',
     'take another',
     'new picture',
     'another picture',
+    'new photo',
+    'another photo',
+    'open the camera',
+    'open camera',
+    'camera',
 ];
-const CLOSE_PHRASES = ['close', 'go back', 'exit', 'done', 'finished'];
+const DELETE_PHRASES = ['delete', 'remove', 'discard', 'erase', 'throw away', 'throw it away', 'get rid of'];
+const CLOSE_PHRASES = [
+    'close',
+    'go back',
+    'go home',
+    'home page',
+    'main menu',
+    'exit',
+    'quit',
+    'done',
+    'finished',
+    "that's all",
+    'thats all',
+    'no more questions',
+];
 const HELP_PHRASES = ['help', 'what can i say', 'what can you do', 'options', 'what do i say'];
 const REPEAT_PHRASES = ['repeat', 'again', 'say that', 'pardon', 'what did you say'];
 const READ_ALL_PHRASES = [
@@ -59,7 +80,19 @@ const AMOUNT_PHRASES = [
 const DATE_PHRASES = ['date', 'when', 'deadline', 'what day', 'due by', 'pay by', 'pay before', 'last day'];
 
 // Answers to "Do you want me to read this document?"
-const CANCEL_PHRASES = ['cancel', 'stop', 'never mind', 'nevermind', 'go back', 'forget it', 'exit', 'close'];
+const CANCEL_PHRASES = [
+    'cancel',
+    'stop',
+    'never mind',
+    'nevermind',
+    'go back',
+    'go home',
+    'forget it',
+    'exit',
+    'close',
+    'delete',
+    'discard',
+];
 const NO_PHRASES = [
     'no',
     'nope',
@@ -78,6 +111,14 @@ const YES_PHRASES = [
     'yeah',
     'yep',
     'yup',
+    // How a short "yes" is often misheard. Only used for this yes/no
+    // question, so there's little risk of a false yes.
+    'yea',
+    'ya',
+    'yah',
+    'yess',
+    'yas',
+    'jess',
     'sure',
     'ok',
     'okay',
@@ -133,6 +174,11 @@ export function parseCommand(transcript) {
 
     if (includesAny(text, STOP_PHRASES)) {
         return { type: 'stop' };
+    }
+    // Before scan and close, so "delete this and scan another" and "I'm done,
+    // delete it" are never taken as keeping the document.
+    if (includesAny(text, DELETE_PHRASES)) {
+        return { type: 'delete' };
     }
     if (includesAny(text, SCAN_PHRASES)) {
         return { type: 'scan' };

@@ -67,7 +67,7 @@ describe('respond', () => {
         expect(respond({ type: 'repeat' }, context()).speech).toMatch(/not read anything/);
     });
 
-    test.each(['stop', 'scan', 'close'])('%s is passed through as an action', (type) => {
+    test.each(['stop', 'scan', 'close', 'delete'])('%s is passed through as an action', (type) => {
         expect(respond({ type }, context())).toEqual({ type });
     });
 
@@ -81,8 +81,13 @@ describe('respond', () => {
 });
 
 describe('introSpeech', () => {
-    test('tells screen reader users to double tap', () => {
-        expect(introSpeech(true)).toMatch(/Double tap the Ask button/);
-        expect(introSpeech(false)).toMatch(/Tap the big button/);
+    test('invites a spoken question without asking for a tap', () => {
+        expect(introSpeech()).toMatch(/Ask me a question/);
+        expect(introSpeech()).not.toMatch(/tap/i);
+    });
+
+    test('says how to finish', () => {
+        expect(introSpeech()).toMatch(/I am done/);
+        expect(introSpeech()).toMatch(/delete this document/);
     });
 });

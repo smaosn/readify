@@ -1,8 +1,13 @@
 import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-speech-recognition';
 import { useRef, useState } from 'react';
+import { Platform } from 'react-native';
 
 // Words the recognizer should favour, so short commands aren't misheard.
 const CONTEXTUAL_STRINGS = [
+    'yes',
+    'no',
+    'yes please',
+    'no thanks',
     'due date',
     'amount due',
     'how much do I owe',
@@ -11,6 +16,9 @@ const CONTEXTUAL_STRINGS = [
     'stop',
     'help',
     'scan a new document',
+    'take a picture',
+    'I am done',
+    'delete this document',
 ];
 
 /**
@@ -26,6 +34,9 @@ export function useVoiceQuestion({ onResult, onError }) {
     // Set once this listen has reported a result or error, so the trailing
     // 'end' event doesn't report it a second time.
     const settledRef = useRef(true);
+    // Bumped by cancel(), so a listen still waiting on the permission check
+    // doesn't start after it was cancelled (e.g. just as the camera opens).
+    const listenIdRef = useRef(0);
 
     const settle = (report) => {
         if (settledRef.current) {
@@ -57,11 +68,15 @@ export function useVoiceQuestion({ onResult, onError }) {
     });
 
     const listen = async () => {
+        const listenId = ++listenIdRef.current;
         if (!ExpoSpeechRecognitionModule.isRecognitionAvailable()) {
             onError('unavailable');
             return;
         }
         const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+        if (listenId !== listenIdRef.current) {
+            return;
+        }
         if (!permission.granted) {
             onError('not-allowed');
             return;
@@ -71,6 +86,13 @@ export function useVoiceQuestion({ onResult, onError }) {
         setIsListening(true);
         ExpoSpeechRecognitionModule.start({
             lang: 'en-US',
+            // iPhone: recognise speech on the phone when it can, so voice
+            // control works offline, audio never leaves the phone, and the
+            // always-on listening doesn't hit Apple's server request limits.
+            // Android is left on its default service, which already works
+            // offline once the phone's offline speech pack is installed;
+            // forcing on-device there fails on phones without the pack.
+            requiresOnDeviceRecognition: Platform.OS === 'ios' && ExpoSpeechRecognitionModule.supportsOnDeviceRecognition(),
             interimResults: true,
             continuous: false,
             maxAlternatives: 3,
@@ -90,6 +112,7 @@ export function useVoiceQuestion({ onResult, onError }) {
 
     // Stops listening and discards the question.
     const cancel = () => {
+        listenIdRef.current += 1;
         settledRef.current = true;
         setIsListening(false);
         ExpoSpeechRecognitionModule.abort();
